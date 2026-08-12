@@ -245,11 +245,73 @@ b.grad: 0.5
   matter for learning — `x1.grad`/`x2.grad` (the *inputs*) are computed but not used, since
   inputs are fixed data, not something we update.
 
-## 11. Open questions / next steps
+## 12. Extending `Value`: negation and subtraction
 
-- Next: use these weight gradients to actually update the weights (gradient descent):
-  `w1.data += -learning_rate * w1.grad`, and similar for other parameters. This is the
-  actual "learning" step.
-- Then: wrap this single-neuron logic into a reusable `Neuron` class, then a `Layer`
+Only had `+` and `*`. Needed `-` to compute a loss like `(o - target)^2`. Rather than
+writing a brand new backward rule, expressed subtraction in terms of what already exists:
+
+```python
+    def __neg__(self):
+        return self * -1
+
+    def __sub__(self, other):
+        return self + (-other)
+```
+
+Also had to make `__mul__` tolerant of plain Python numbers (not just `Value` objects),
+since `self * -1` passes a raw `int`, not a `Value`:
+
+```python
+    def __mul__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        out = Value(self.data * other.data, (self, other), '*')
+        ...
+```
+
+Without this, `self * -1` would crash trying to access `.data` on an `int`. (Note:
+`__add__` doesn't have this same guard yet — works for now since we haven't needed
+`value + plain_number`, but would need the same fix if that comes up.)
+
+## 13. Gradient descent — the actual "learning" step
+
+Earlier experiment (nudging `o` up by following `o`'s own gradient) was a mistake in
+framing — there was no real target, just an arbitrary direction to demonstrate the update
+formula. Real training needs a **target/label** and a **loss function** that measures
+distance from that target; backward must be run on the *loss*, not on the raw output.
+
+Correct setup:
+
+```python
+target = Value(1.0)
+loss = (o - target) * (o - target)   # squared error
+loss.backward()
+```
+
+Update rule — always subtract the gradient (move *against* it), since the goal is always
+to *decrease* the loss:
+
+```python
+learning_rate = 0.05
+w1.data -= learning_rate * w1.grad
+w2.data -= learning_rate * w2.grad
+b.data -= learning_rate * b.grad
+```
+
+Ran one full cycle on the reference neuron (`x1=2.0, x2=0.0, w1=-3.0, w2=1.0,
+b=6.8813735870195432`, target `1.0`):
+
+- Before update: `o = 0.7071`, `loss = 0.0858`
+- Gradients (via `loss.backward()`, not `o.backward()`): `w1.grad = -0.5858`,
+  `w2.grad = 0.0`, `b.grad = -0.2929`
+- After one update step (`lr=0.05`): `o = 0.7419`, `loss = 0.0666`
+
+Loss went down, output moved closer to the target. This is one iteration of what will
+become the training loop: forward → compute loss → backward → update → repeat.
+
+## 14. Open questions / next steps
+
+- Try repeating this update step in a loop (many iterations) and watch the loss decrease
+  over time — the basic training loop.
+- Then: wrap the single-neuron logic into a reusable `Neuron` class, then a `Layer`
   (multiple neurons sharing the same inputs), then an `MLP` (multiple layers chained
-  together) — building up from this `Value` engine as the foundation.
+  together), using this `Value` engine as the foundation.
