@@ -162,11 +162,94 @@ later contribution would silently overwrite an earlier one, silently producing a
 Verified with `a = Value(3.0)`, `b = a + a` (i.e. `b = 2a`, so `db/da = 2`
 analytically): `b.backward()` gives `a.grad = 2.0`. Matches.
 
-## 8. Open questions / next steps
+## 8. Why a nonlinearity is needed (tanh)
 
-- Still only have `+` and `*`. Will need `tanh`, `exp`, `**` (power) and similar nonlinear
-  operations to actually build a neural network (linear operations alone can't create
-  depth that matters — stacking only `+`/`*` layers collapses back into one big linear
-  function, no matter how many layers).
-- Next: implement a single `Neuron` (weights + bias + nonlinearity), then a `Layer`, then
-  an `MLP` (multi-layer perceptron), using this `Value` engine as the foundation.
+Stacking only `+`/`*` layers never actually creates "depth" — it always collapses back into
+one big linear function. Example: `z = w2*(w1*x + b1) + b2 = (w2*w1)*x + (w2*b1 + b2)`,
+which is still just `z = W*x + B`. No matter how many linear layers you stack, the whole
+thing simplifies to a single linear equation, so extra layers add zero expressive power.
+
+Real-world relationships (image recognition, price curves, etc.) are usually not linear, so
+a network needs a nonlinear "squashing" function between layers to actually benefit from
+depth. Chose `tanh` (as in the Karpathy series) because:
+- it squashes any input into a bounded range, `(-1, 1)`
+- it has a clean derivative expressible in terms of its own output, which keeps the
+  backward rule simple (see below)
+- modern networks often use `ReLU` instead, but `tanh` is easier to derive by hand for
+  learning purposes
+
+## 9. Implementing `tanh` on `Value`
+
+```
+tanh(x) = (e^(2x) - 1) / (e^(2x) + 1)     # algebraically equivalent to (e^x - e^-x)/(e^x + e^-x),
+                                            # just numerically simpler (one exponential term)
+d(tanh(x))/dx = 1 - tanh(x)^2
+```
+
+```python
+    def tanh(self):
+        x = self.data
+        t = (math.exp(2*x) - 1) / (math.exp(2*x) + 1)
+        out = Value(t, (self,), 'tanh')
+
+        def _backward():
+            self.grad += (1 - t**2) * out.grad
+        out._backward = _backward
+
+        return out
+```
+
+- `tanh` is unary (only `self`, no `other`), so only `self.grad` gets a contribution.
+- The local derivative `1 - t**2` reuses `t` (the already-computed forward value) instead
+  of recomputing any exponentials — cheap to evaluate in the backward pass.
+- `(self,)` — note the trailing comma. Needed to make this a one-element tuple; without it,
+  Python would just treat it as `self` in parentheses, not a tuple, and `_prev` construction
+  would break.
+- **Bug hit along the way:** forgot `return out` in `__mul__` at one point, which silently
+  made every multiplication return `None`. Lesson: every method that builds a new `Value`
+  must explicitly `return out`, or the whole chain downstream breaks with confusing
+  `NoneType` errors.
+
+Verified `Value(0.0).tanh()` gives `data=0.0` (matches `tanh(0) = 0` analytically).
+
+## 10. First full neuron: forward + backward
+
+Built a single neuron with 2 inputs, weights, and a bias, matching the Karpathy reference
+example:
+
+```
+x1=2.0, x2=0.0, w1=-3.0, w2=1.0, b=6.8813735870195432
+n = x1*w1 + x2*w2 + b     # "pre-activation"
+o = tanh(n)                # "activation" / output
+```
+
+Forward result: `n = 0.8814`, `o = 0.7071` — matches the reference video's numbers exactly
+(the odd decimal value of `b` was chosen deliberately to produce a "nice" output).
+
+Ran `o.backward()`:
+
+```
+x1.grad: -1.5
+x2.grad: 0.5
+w1.grad: 1.0
+w2.grad: 0.0
+b.grad: 0.5
+```
+
+- `w2.grad = 0.0` is notable: since `x2 = 0`, and a multiplication's local gradient is
+  "the value of the other factor," `w2`'s gradient is exactly `x2 = 0`. Intuition: right now,
+  changing `w2` has zero effect on the output, because it's being multiplied by zero anyway.
+- `x1.grad = -1.5` is the largest in magnitude, because `x1` is multiplied by `w1 = -3.0`
+  (a relatively large weight) — small changes to `x1` get amplified.
+- In a real network, `w1.grad`/`w2.grad`/`b.grad` (the *parameters*) are what actually
+  matter for learning — `x1.grad`/`x2.grad` (the *inputs*) are computed but not used, since
+  inputs are fixed data, not something we update.
+
+## 11. Open questions / next steps
+
+- Next: use these weight gradients to actually update the weights (gradient descent):
+  `w1.data += -learning_rate * w1.grad`, and similar for other parameters. This is the
+  actual "learning" step.
+- Then: wrap this single-neuron logic into a reusable `Neuron` class, then a `Layer`
+  (multiple neurons sharing the same inputs), then an `MLP` (multiple layers chained
+  together) — building up from this `Value` engine as the foundation.
