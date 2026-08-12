@@ -106,14 +106,67 @@ calling backward) are two different things — the first is just an uninitialize
 the second is the deliberate starting point of the backward pass, because the derivative
 of the final output with respect to itself is always `1`.
 
-## 6. Open questions / next steps
+## 6. Topological sort — automating the backward pass
 
-- Calling `._backward()` manually, one node at a time, in the right order, does not scale
-  to large graphs. Need an automatic way to visit every node in the correct order
-  (topological sort) so a single `d.backward()` call handles everything.
-- Haven't yet tested what happens when a value is reused in multiple places
-  (e.g. `a` used in both `e = a*b` and `f = a*c`) — this is where the `+=` in `_backward`
-  (instead of `=`) should matter, since gradients from multiple paths need to accumulate.
+Calling `._backward()` manually, one node at a time, in the right order, does not scale to
+large graphs. The fix is a `backward()` method that automatically visits every node in the
+correct order:
+
+```python
+def backward(self):
+    topo = []
+    visited = set()
+    def build_topo(v):
+        if v not in visited:
+            visited.add(v)
+            for child in v._prev:
+                build_topo(child)
+            topo.append(v)
+    build_topo(self)
+
+    self.grad = 1.0
+    for node in reversed(topo):
+        node._backward()
+
+Value.backward = backward
+```
+
+- `build_topo` is recursive: it processes all of a node's children *before* adding the node
+  itself to `topo`. This guarantees children come before parents in the list.
+- `reversed(topo)` flips this to parent-before-children order, which is exactly the order
+  backward propagation needs (start at the root, push gradient down to the leaves).
+- `self.grad = 1.0` automates what was previously done by hand — the root's derivative
+  with respect to itself is always `1`.
+
+Tested on the same `a, b, c, e, d` graph as before: calling just `d.backward()` (no manual
+`._backward()` calls) reproduced the exact same gradients (`a.grad=-3.0`, `b.grad=2.0`,
+`c.grad=1.0`). Confirms the automation is correct.
+
+## 7. Gradient accumulation — why `+=` matters
+
+Tested what happens when a value is reused in multiple places, e.g. `b = a + a` (so `a` is
+used twice as input to the same operation).
+
+Key idea: **total derivative**. If a value contributes to the output through multiple paths,
+its total effect is the *sum* of the effects through each path — not the max, not just one
+of them. Nudging `a` up by 1 unit changes `b` by 1 unit through the first `+ a`, and by
+another 1 unit through the second `+ a`, for a total of 2. In neural net terms: if a weight
+feeds into 5 different neurons, its effect on the loss is the sum of its effect through
+each of those 5 paths.
+
+This is exactly why `_backward` uses `self.grad += ...` and `other.grad += ...` instead of
+`=`. With `+=`, each contribution accumulates on top of what's already there. With `=`, a
+later contribution would silently overwrite an earlier one, silently producing a wrong
+(too small) gradient.
+
+Verified with `a = Value(3.0)`, `b = a + a` (i.e. `b = 2a`, so `db/da = 2`
+analytically): `b.backward()` gives `a.grad = 2.0`. Matches.
+
+## 8. Open questions / next steps
+
 - Still only have `+` and `*`. Will need `tanh`, `exp`, `**` (power) and similar nonlinear
   operations to actually build a neural network (linear operations alone can't create
-  depth that matters).
+  depth that matters — stacking only `+`/`*` layers collapses back into one big linear
+  function, no matter how many layers).
+- Next: implement a single `Neuron` (weights + bias + nonlinearity), then a `Layer`, then
+  an `MLP` (multi-layer perceptron), using this `Value` engine as the foundation.
