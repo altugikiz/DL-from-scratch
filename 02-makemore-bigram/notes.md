@@ -309,12 +309,61 @@ network approach doesn't require enumerating every possible context combination 
 a function instead — so it scales to arbitrarily long context, which is the direction the
 rest of the Karpathy series (MLP → RNN → Transformer) is headed.
 
-## 11. Open questions / next steps
+## 12. Sampling from the trained network, compared to the counting model
 
-- Generate new names by sampling from the *trained* `W`-based model (same `multinomial`
-  sampling loop as the counting model) and compare output quality against the counting
-  model's samples.
-- Explore what happens with different learning rates on this larger problem (only tried 50
-  so far).
-- Continue the Karpathy series toward MLP-based language models (using more than 1 character
-  of context), then RNN/Transformer.
+Same sampling loop as the counting model, but each step now does a forward pass through
+`W` instead of reading a row of `N` directly:
+
+```python
+g = torch.Generator().manual_seed(2147483647)
+for i in range(10):
+    out = []
+    ix = 0
+    while True:
+        xenc = F.one_hot(torch.tensor([ix]), num_classes=27).float()
+        logits = xenc @ W
+        counts = logits.exp()
+        p = counts / counts.sum(1, keepdims=True)
+        ix = torch.multinomial(p, num_samples=1, replacement=True, generator=g).item()
+        out.append(itos[ix])
+        if ix == 0:
+            break
+    print(''.join(out))
+```
+
+Results, side by side with the counting model's output (same seed):
+
+| Counting model | Neural net model |
+|---|---|
+| `cexze.` | `cexze.` — identical |
+| `momasurailezitynn.` | `momasurailezityha.` — near-identical |
+| `konimittain.` | `konimittain.` — identical |
+| `llayn.` | `llayn.` — identical |
+| `ka.` | `ka.` — identical |
+| `da.` | `da.` — identical |
+| `staiyaubrtthrigotai.` | `staiyauelalerigotai.` — same start, diverges partway |
+| `moliellavo.` | `moliellavo.` — identical |
+| `ke.` | `ke.` — identical |
+| `teda.` | `teda.` — identical |
+
+8 of 10 generated names came out byte-for-byte identical, the other 2 nearly so. Not a
+coincidence — this directly reflects how close the two models' scores were (`2.4541` vs
+`2.4729` avg NLL): gradient descent converged `W` to a probability distribution very close
+to what direct counting/normalizing produces. Counting and gradient descent are two
+different routes to essentially the same answer for this simple problem; the value of the
+gradient-descent route is that, unlike counting, it scales to much longer contexts where
+enumerating a full count table becomes intractable (trigram, 4-gram, ... eventually
+Transformer-scale context).
+
+## 13. Status: `02-makemore-bigram` complete
+
+Built, end to end: bigram counting from 32,033 names → probability matrix → sampling new
+names → quantitative scoring via negative log likelihood → reframed as a trainable one-layer
+neural network (one-hot input, linear layer, softmax) → trained with real gradient descent
+(PyTorch autograd) on all 228,146 bigrams → confirmed it converges to essentially the same
+result as direct counting, both in loss (~2.47 vs ~2.45) and in generated samples (8/10
+identical). This is the first working example (after 01-micrograd's from-scratch engine) of
+using PyTorch's built-in `Tensor`/`autograd` for a real, if small, language model.
+
+Next in the series: extend from 1-character context (bigram) to a learned, multi-character
+context using an MLP — the natural next step toward RNN/Transformer-scale models.
