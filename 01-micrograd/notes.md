@@ -308,10 +308,90 @@ b=6.8813735870195432`, target `1.0`):
 Loss went down, output moved closer to the target. This is one iteration of what will
 become the training loop: forward → compute loss → backward → update → repeat.
 
-## 14. Open questions / next steps
+## 15. `Neuron` class — generalizing the single-neuron example
 
-- Try repeating this update step in a loop (many iterations) and watch the loss decrease
-  over time — the basic training loop.
-- Then: wrap the single-neuron logic into a reusable `Neuron` class, then a `Layer`
-  (multiple neurons sharing the same inputs), then an `MLP` (multiple layers chained
-  together), using this `Value` engine as the foundation.
+Instead of manually declaring `x1, x2, w1, w2, b` every time, wrapped the pattern into a
+reusable class. Number of weights always equals number of inputs (`nin`) — each input gets
+its own weight because the network needs to learn how much each input should matter.
+Bias adds an offset/shift so the neuron isn't forced through zero when all inputs are zero
+(same role as the `+n` in `y = mx + n`). Both weights and bias start **random**, and are
+learned from data via gradient descent — never hand-picked (the earlier `b = 6.881...`
+example was a special, deliberately-chosen value just for matching a reference output).
+
+```python
+import random
+
+class Neuron:
+    def __init__(self, nin):
+        self.w = [Value(random.uniform(-1, 1)) for _ in range(nin)]
+        self.b = Value(random.uniform(-1, 1))
+
+    def __call__(self, x):
+        act = sum((wi*xi for wi, xi in zip(self.w, x)), self.b)
+        out = act.tanh()
+        return out
+```
+
+- `__call__` makes the object callable like a function: `n = Neuron(2); n([x1, x2])`.
+- `x` here is the list of input `Value`s the neuron receives — e.g. `[Value(2.0), Value(3.0)]`.
+- `zip(self.w, x)` pairs each weight with its matching input so `wi*xi` computes `w1*x1`,
+  `w2*x2`, etc.; `sum(..., self.b)` adds them all up starting from the bias.
+
+## 16. `Layer` class — multiple neurons, same inputs
+
+A layer is several neurons side by side, all receiving the *same* input list, each with its
+own independent (random) weights, each producing its own single output.
+
+```python
+class Layer:
+    def __init__(self, nin, nout):
+        self.neurons = [Neuron(nin) for _ in range(nout)]
+
+    def __call__(self, x):
+        outs = [n(x) for n in self.neurons]
+        return outs
+```
+
+Important distinction that was initially confused: `nin × nout` gives the total number of
+**weights** in the layer (e.g. `Layer(2, 3)` → 3 neurons × 2 weights each = 6 weights total).
+But the layer's **output** is a list of length `nout` only — one number per neuron,
+regardless of how many inputs each neuron takes in. Each neuron "summarizes" its inputs down
+to a single number.
+
+Tested `Layer(2, 3)` on `x = [Value(2.0), Value(3.0)]` → got a 3-element list of `Value`s, as
+expected.
+
+## 17. `MLP` class — chaining layers
+
+An MLP (multi-layer perceptron) is layers chained so one layer's output list becomes the
+next layer's input list.
+
+```python
+class MLP:
+    def __init__(self, nin, nouts):
+        sz = [nin] + nouts
+        self.layers = [Layer(sz[i], sz[i+1]) for i in range(len(nouts))]
+
+    def __call__(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+```
+
+- `nouts` is a list of layer sizes, e.g. `[4, 4, 1]` means: hidden layer of 4 neurons →
+  hidden layer of 4 neurons → output layer of 1 neuron.
+- `sz = [nin] + nouts` builds the full chain of sizes (e.g. `[2, 4, 4, 1]`) so each `Layer`
+  knows how many inputs it receives and how many neurons (outputs) it has.
+
+Tested `MLP(2, [4, 4, 1])` on `x = [Value(2.0), Value(3.0)]` → got a single-element list
+(since the final layer has only 1 neuron), confirming the chain works end to end: 2 inputs →
+4 → 4 → 1 output. This is a full from-scratch neural network — no frameworks.
+
+## 18. Open questions / next steps
+
+- Next: train this MLP on a small toy dataset (multiple input examples, each with a target
+  label), looping forward → loss → zero-grad → backward → update, same pattern as the
+  single-neuron training loop but now across a whole batch and a deeper network.
+- Still haven't explored what happens with more aggressive learning rates on a *deeper*
+  network (only tested this on the single-neuron case, where `tanh` saturation accidentally
+  made a very large learning rate look stable — that result doesn't necessarily generalize).
