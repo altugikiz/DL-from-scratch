@@ -387,11 +387,113 @@ Tested `MLP(2, [4, 4, 1])` on `x = [Value(2.0), Value(3.0)]` → got a single-el
 (since the final layer has only 1 neuron), confirming the chain works end to end: 2 inputs →
 4 → 4 → 1 output. This is a full from-scratch neural network — no frameworks.
 
-## 18. Open questions / next steps
+## 19. `parameters()` — collecting every weight and bias into one list
 
-- Next: train this MLP on a small toy dataset (multiple input examples, each with a target
-  label), looping forward → loss → zero-grad → backward → update, same pattern as the
-  single-neuron training loop but now across a whole batch and a deeper network.
-- Still haven't explored what happens with more aggressive learning rates on a *deeper*
-  network (only tested this on the single-neuron case, where `tanh` saturation accidentally
-  made a very large learning rate look stable — that result doesn't necessarily generalize).
+Manually referencing `mlp.layers[0].neurons[0].w[0]` for 41 separate parameters doesn't
+scale. Added a `parameters()` method to each class that recursively collects everything
+from its sub-components into one flat list:
+
+```python
+# in Neuron
+    def parameters(self):
+        return self.w + [self.b]
+
+# in Layer
+    def parameters(self):
+        return [p for neuron in self.neurons for p in neuron.parameters()]
+
+# in MLP
+    def parameters(self):
+        return [p for layer in self.layers for p in layer.parameters()]
+```
+
+Verified parameter count by hand for `MLP(3, [4, 4, 1])`:
+- layer 1 (`Layer(3,4)`): 4 neurons × (3 weights + 1 bias) = 16
+- layer 2 (`Layer(4,4)`): 4 neurons × (4 weights + 1 bias) = 20
+- layer 3 (`Layer(4,1)`): 1 neuron × (4 weights + 1 bias) = 5
+- total = 41 — matched `len(mlp.parameters())` exactly.
+
+**Bug hit along the way:** pasted all three `parameters()` methods into the same class
+(`MLP`) instead of distributing one to each class. Symptom: `AttributeError: 'MLP' object
+has no attribute 'w'` — because the `Neuron`-specific body (`self.w + [self.b]`) ended up
+inside `MLP`, which has no `.w`. Lesson: when adding the "same shaped" method to multiple
+related classes, double check each one landed inside the right class body, not just that
+the method exists somewhere.
+
+## 20. Full training loop on a toy dataset
+
+Dataset (from the reference example):
+
+```python
+xs = [[2.0, 3.0, -1.0], [3.0, -1.0, 0.5], [0.5, 1.0, 1.0], [1.0, 1.0, -1.0]]
+ys = [1.0, -1.0, -1.0, 1.0]
+mlp = MLP(3, [4, 4, 1])
+```
+
+Also needed:
+- `__pow__` on `Value` (for `(pred - target)**2`), using the power rule
+  `d(x^n)/dx = n * x^(n-1)`.
+- `isinstance` guard in `__add__` (mirroring the one already in `__mul__`) — without it,
+  `Value - float` crashed with `AttributeError: 'float' object has no attribute 'data'`,
+  because subtraction is implemented as `self + (-other)` and `other` here is a plain
+  Python number, not a `Value`.
+- `__radd__` on `Value` — needed because `sum(generator)` starts from plain `0` internally
+  (`0 + Value(...)`), and Python falls back to `__radd__` on the right-hand operand when the
+  left-hand type's own `__add__` fails.
+
+Loop:
+
+```python
+for k in range(20):
+    ypred = [mlp(x)[0] for x in xs]
+    loss = sum((yout - ygt)**2 for ygt, yout in zip(ys, ypred))
+
+    for p in mlp.parameters():
+        p.grad = 0          # must zero every iteration — _backward uses += (accumulates),
+                              # so without this, gradients from the previous iteration would
+                              # add onto the new ones instead of being replaced
+    loss.backward()
+
+    for p in mlp.parameters():
+        p.data -= 0.05 * p.grad
+```
+
+Key clarification worked through: the gradient computed each iteration is *not* saved up
+and used later — it's computed and consumed within the same iteration (steps: forward →
+zero_grad → backward → update, in that order, every loop pass). What persists across
+iterations is `p.data` (the parameter values), which each iteration nudges a little further
+in the loss-reducing direction. The next iteration's forward pass then runs on the
+just-updated parameters.
+
+Result: loss went from `4.78` (iteration 0) down to `0.05` (iteration 19) — roughly a
+100x reduction over 20 iterations. Final predictions vs targets:
+
+```
+target:  1.0   →  0.8712
+target: -1.0   → -0.9530
+target: -1.0   → -0.8687
+target:  1.0   →  0.8975
+```
+
+All four predictions moved substantially toward their targets. This confirms the full
+pipeline works end to end: a from-scratch `Value` autograd engine, chained into
+`Neuron`/`Layer`/`MLP`, actually learns from data via gradient descent — no PyTorch,
+no TensorFlow, just the two core rules (sum → gradient passes through as 1, product →
+gradient is the other factor) applied recursively across a real (if tiny) network.
+
+## 21. What's covered vs what's still open (vs. the Karpathy video)
+
+Core mechanics from the video are done: `Value`, manual + automatic backward, topological
+sort, `tanh`, building up `Neuron` → `Layer` → `MLP`, and a full training loop with
+falling loss.
+
+Not yet done, still on the list:
+- **Graphviz visualization** of the computational graph (the `trace`/`Digraph` code seen in
+  the original lecture screenshot) — would help visually confirm the graph structure
+  instead of only reasoning about it in text.
+- **Comparison against real PyTorch** — running the same forward/backward computation in
+  actual PyTorch and checking the numbers match, as a final correctness/confidence check.
+- A few more operator overloads (`__rmul__`, `__truediv__`, etc.) for full ergonomic parity
+  with the video's version of `Value`.
+- The video's end-of-lecture exercises (e.g. adding `exp`, `log`, alternative loss
+  functions).
