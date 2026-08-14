@@ -481,18 +481,64 @@ pipeline works end to end: a from-scratch `Value` autograd engine, chained into
 no TensorFlow, just the two core rules (sum → gradient passes through as 1, product →
 gradient is the other factor) applied recursively across a real (if tiny) network.
 
-## 21. What's covered vs what's still open (vs. the Karpathy video)
+## 22. Visualizing the computational graph with graphviz
 
-Core mechanics from the video are done: `Value`, manual + automatic backward, topological
-sort, `tanh`, building up `Neuron` → `Layer` → `MLP`, and a full training loop with
-falling loss.
+Added a `label` field to `Value` (`__init__(self, data, _children=(), _op='', label='')`,
+plus `self.label = label`) so nodes can be named in the graph, and two helper functions:
 
-Not yet done, still on the list:
-- **Graphviz visualization** of the computational graph (the `trace`/`Digraph` code seen in
-  the original lecture screenshot) — would help visually confirm the graph structure
-  instead of only reasoning about it in text.
-- **Comparison against real PyTorch** — running the same forward/backward computation in
-  actual PyTorch and checking the numbers match, as a final correctness/confidence check.
+```python
+from graphviz import Digraph
+
+def trace(root):
+    nodes, edges = set(), set()
+    def build(v):
+        if v not in nodes:
+            nodes.add(v)
+            for child in v._prev:
+                edges.add((child, v))
+                build(child)
+    build(root)
+    return nodes, edges
+
+def draw_dot(root):
+    dot = Digraph(format='svg', graph_attr={'rankdir': 'LR'})
+    nodes, edges = trace(root)
+    for n in nodes:
+        uid = str(id(n))
+        dot.node(name=uid, label=f"{{ {n.label} | data {n.data:.4f} | grad {n.grad:.4f} }}", shape='record')
+        if n._op:
+            dot.node(name=uid + n._op, label=n._op)
+            dot.edge(uid + n._op, uid)
+    for n1, n2 in edges:
+        dot.edge(str(id(n1)), str(id(n2)) + n2._op)
+    return dot
+```
+
+`trace` walks the graph the same way `build_topo` does (recursively via `_prev`), but
+collects both the node set and the edge set instead of building a backward order. `draw_dot`
+draws one box per `Value` (showing `label`, `data`, `grad`) and one small circle per
+operation (`+`, `*`, `tanh`), wiring them left to right (`rankdir: LR`).
+
+Ran it on the single-neuron example (`x1=2.0, x2=0.0, w1=-3.0, w2=1.0,
+b=6.8813735870195432`) after calling `o.backward()`. The rendered graph visually confirmed
+every gradient computed earlier by hand:
+
+- `o.grad = 1.0` (root)
+- `n.grad = 0.5` — from tanh's local rule `1 - tanh(x)^2 = 1 - 0.7071^2 ≈ 0.5`, times `o.grad=1`
+- both addition inputs (`x1*w1+x2*w2` and `b`) inherit `grad = 0.5` unchanged (sum rule)
+- `x1.grad = -1.5` — product rule: `w1.data (-3.0) × incoming grad (0.5)`
+- `w1.grad = 1.0` — product rule: `x1.data (2.0) × incoming grad (0.5)`
+- `w2.grad = 0.0` — product rule: `x2.data (0.0) × incoming grad (0.5)`, confirming again
+  that a zero input kills the gradient for its paired weight
+
+Seeing the whole forward-then-backward chain in one picture — values flowing left to right,
+gradients implicitly flowing right to left through the same boxes — tied together every
+piece built so far (Value, operator rules, chain rule, tanh) into a single mental image.
+
+## 23. Open questions / next steps
+
+- Still want to compare this engine's output against real PyTorch on the same computation,
+  as a final correctness check (per the original video).
 - A few more operator overloads (`__rmul__`, `__truediv__`, etc.) for full ergonomic parity
   with the video's version of `Value`.
 - The video's end-of-lecture exercises (e.g. adding `exp`, `log`, alternative loss
