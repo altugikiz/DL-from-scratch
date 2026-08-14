@@ -142,12 +142,179 @@ Mixed quality — some short outputs (`ka`, `da`, `ke`) look plausibly name-like
 has no sense of overall word length/shape or longer patterns — it can chain together
 locally-plausible pairs that add up to something globally implausible.
 
-## 7. Open questions / next steps
+## 8. Scoring the model: negative log likelihood (NLL)
 
-- Need a way to *quantitatively* score how good this model is (not just eyeballing
-  generated samples) — negative log likelihood (NLL), which plays the same role loss played
-  in 01-micrograd's training loop, but here to score a fixed counting-based model rather
-  than to drive gradient-based updates (yet).
-- The eventual goal (per the video description) is to evolve this counting-based bigram
-  model into a neural-network version trained with gradient descent, and later into deeper
-  architectures (MLP, then RNN/Transformer) that use more than one character of context.
+Eyeballing generated samples is subjective. Need a quantitative score for "how good is this
+model" — negative log likelihood, which plays the same role `loss` played in 01-micrograd's
+training loop.
+
+**Why "likelihood"?** If the model is good, it should assign high probability to bigrams
+that actually occur in the real data. The likelihood of the whole dataset (under the model)
+is the product of the individual bigram probabilities (independent events multiply):
+
+```
+p(emma) = p(.e) × p(em) × p(mm) × p(ma) × p(a.)
+```
+
+**Why take the log?** Multiplying hundreds of thousands of numbers each less than 1
+underflows to an unusably tiny number. `log(a×b) = log(a) + log(b)` turns the product into a
+sum, which stays numerically manageable.
+
+**Why negative?** `log(x)` for `x` in `(0,1)` is always negative, so the sum of logs is
+negative too. Flipping the sign gives a positive number that's easier to reason about as a
+"loss" — something to minimize. Lower NLL (closer to 0) = better model; a perfect model
+(100% probability on every real transition) would score exactly 0.
+
+```python
+log_likelihood = 0.0
+n = 0
+for w in words:
+    chs = ['.'] + list(w) + ['.']
+    for ch1, ch2 in zip(chs, chs[1:]):
+        ix1, ix2 = stoi[ch1], stoi[ch2]
+        prob = N[ix1, ix2].float() / N[ix1].float().sum()
+        logprob = torch.log(prob)
+        log_likelihood += logprob
+        n += 1
+nll = -log_likelihood
+avg_nll = nll / n   # average over all bigrams — normalizes for different word lengths
+```
+
+**Word length → bigram count**: an `L`-letter word produces `L+1` bigrams (after adding the
+start/end `.`). Verified by hand: `emma` (4 letters) → 5 bigrams, `olivia` (6) → 7, `ava` (3)
+→ 4, totaling 16 for the first 3 words — matched the code's `n=16` output exactly.
+
+Result on the full dataset (32,033 words, 228,146 bigrams): **avg nll = 2.4541**. This is
+the counting-based model's quality score — the number the neural-net version will later be
+compared against.
+
+## 9. From counting to a trainable neural network
+
+The counting approach (`N` matrix) works for bigrams but doesn't scale: trigram needs
+27³ ≈ 20K cells, 5-character context needs 27⁵ ≈ 14M cells — real language models with much
+longer context need a fundamentally different approach. The fix: replace the fixed count
+table with a **trainable weight matrix** learned via gradient descent — same idea as
+01-micrograd's `Neuron`, just applied to this problem.
+
+**Input encoding — one-hot, not raw index.** Feeding a raw character index (e.g. `stoi['a']
+= 1`) directly into a network would wrongly imply an ordering/magnitude relationship between
+letters (as if 'a' < 'b' numerically). Instead, each character is represented as a 27-length
+vector with a single `1` at its index and `0` elsewhere — no letter is "bigger" than another.
+
+```python
+import torch.nn.functional as F
+xs_ex = torch.tensor([1])
+xenc = F.one_hot(xs_ex, num_classes=27).float()   # shape (1, 27), 1 at index 1 ('a')
+```
+
+**One linear layer + softmax = the whole "network" here:**
+
+```python
+g = torch.Generator().manual_seed(2147483647)
+W = torch.randn((27, 27), generator=g, requires_grad=True)   # random, trainable
+
+logits = xenc @ W          # (1,27) — matrix multiply; since xenc is one-hot, this is
+                             # equivalent to just picking out row W[ix] of W
+counts = logits.exp()       # softmax step 1: force everything positive
+probs = counts / counts.sum(1, keepdims=True)   # softmax step 2: normalize to sum to 1
+```
+
+**Why `exp()` specifically (not some other transform)?** Two reasons: (1) `e^x` is always
+positive regardless of sign of `x`, turning arbitrary logits into count-like positive
+numbers; (2) `d(e^x)/dx = e^x` — the derivative equals the function itself, the cleanest
+possible gradient rule, which is why `e` (not 2, 10, or any other base) is the standard
+choice for this kind of exponential transform.
+
+**Clarified: `tanh` and `exp` solve different problems, not competing options for the same
+slot.** `tanh` is a bounded (-1 to 1) nonlinearity used *inside* a neuron to prevent
+activations from exploding across layers and to allow both positive and negative outputs.
+`exp` (inside softmax) is specifically for turning arbitrary real-valued logits into
+positive, sum-to-1 probabilities at the *output*. Using `tanh` for softmax would produce
+invalid (possibly negative) "probabilities"; using `exp` inside a neuron's activation would
+let values explode unboundedly across layers. Each is suited to its own job by construction
+— not interchangeable, and not a "which one is simpler" comparison.
+
+**Also clarified: `tan` (trigonometric) vs `tanh` (hyperbolic) are different functions
+entirely, despite similar names.** `tan(x) = sin(x)/cos(x)`, unbounded, shoots to infinity
+near its asymptotes, derivative `1 + tan(x)^2` is also unbounded. `tanh(x)`, by contrast, is
+always strictly between -1 and 1 (approaches but never reaches those bounds — this
+"squashing toward but never past ±1" is exactly what saturation looks like), derivative
+`1 - tanh(x)^2` stays bounded between 0 and 1. This bounded-ness (both function and
+derivative) is why `tanh` is safe inside a neural net and `tan` is never used there.
+
+## 10. Training the bigram network with gradient descent
+
+Built the full training set: every bigram across all 32,033 words as `(input_char_index,
+target_char_index)` pairs.
+
+```python
+xs, ys = [], []
+for w in words:
+    chs = ['.'] + list(w) + ['.']
+    for ch1, ch2 in zip(chs, chs[1:]):
+        xs.append(stoi[ch1])
+        ys.append(stoi[ch2])
+xs = torch.tensor(xs)
+ys = torch.tensor(ys)
+num = xs.nelement()   # 228146 — total bigram count across the whole dataset
+```
+
+`torch.tensor(...)` converts a plain Python list into PyTorch's native data structure —
+required because PyTorch's math operations (matrix multiply, `exp`, `backward`) only work on
+`Tensor` objects, not on ordinary Python lists.
+
+Training loop:
+
+```python
+g = torch.Generator().manual_seed(2147483647)
+W = torch.randn((27, 27), generator=g, requires_grad=True)
+
+for k in range(100):
+    xenc = F.one_hot(xs, num_classes=27).float()
+    logits = xenc @ W
+    counts = logits.exp()
+    probs = counts / counts.sum(1, keepdims=True)
+    loss = -probs[torch.arange(num), ys].log().mean()
+
+    W.grad = None       # PyTorch idiom for zeroing gradients (equivalent to = 0)
+    loss.backward()
+    W.data += -50 * W.grad   # note the large learning rate — needed because averaging
+                               # over 228K examples makes gradients naturally small
+```
+
+`probs[torch.arange(num), ys]` picks out, for every one of the 228,146 examples, the
+probability the model assigned to the *actual* next character — the tensor equivalent of
+the by-hand `N[ix1,ix2]/N[ix1].sum()` lookup, done for all examples simultaneously.
+
+**Why does `loss.backward()` reach all the way back through the whole computation?**
+`loss` is downstream of the full chain `xenc → logits (via W) → counts → probs → loss`.
+Every one of `W`'s 729 elements influences `loss` indirectly through this chain (since every
+one of the 228K bigrams' probability comes from the relevant row of `W`, and all of them
+feed into the single loss value). `backward()` walks back through that whole chain once and
+computes, for every element of `W`, exactly how much nudging it would move `loss` — same
+mechanism as 01-micrograd's `Value.backward()`, just PyTorch's own (much faster) built-in
+autograd doing the work instead of hand-written `_backward` functions.
+
+**Result:** loss went from `3.7590` (iteration 0) to `2.4729` (iteration 99) — and notably,
+this is nearly identical to the counting-based model's `avg nll = 2.4541`. Two completely
+different approaches (direct counting vs. random init + iterative gradient descent) converge
+to essentially the same score, which makes sense: both are solving the same underlying
+problem (best-fit bigram probabilities), counting just solves it directly/closed-form while
+gradient descent approaches it iteratively.
+
+**Why bother with the gradient descent version if counting gets there just as well (and
+faster) for bigrams?** Scalability. A count table for trigram needs 27³ cells, 4-gram 27⁴,
+and quickly becomes intractable for the longer contexts real language models use. The neural
+network approach doesn't require enumerating every possible context combination — it learns
+a function instead — so it scales to arbitrarily long context, which is the direction the
+rest of the Karpathy series (MLP → RNN → Transformer) is headed.
+
+## 11. Open questions / next steps
+
+- Generate new names by sampling from the *trained* `W`-based model (same `multinomial`
+  sampling loop as the counting model) and compare output quality against the counting
+  model's samples.
+- Explore what happens with different learning rates on this larger problem (only tried 50
+  so far).
+- Continue the Karpathy series toward MLP-based language models (using more than 1 character
+  of context), then RNN/Transformer.
