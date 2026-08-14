@@ -535,11 +535,57 @@ Seeing the whole forward-then-backward chain in one picture — values flowing l
 gradients implicitly flowing right to left through the same boxes — tied together every
 piece built so far (Value, operator rules, chain rule, tanh) into a single mental image.
 
-## 23. Open questions / next steps
+## 24. Cross-checking against real PyTorch
 
-- Still want to compare this engine's output against real PyTorch on the same computation,
-  as a final correctness check (per the original video).
-- A few more operator overloads (`__rmul__`, `__truediv__`, etc.) for full ergonomic parity
-  with the video's version of `Value`.
-- The video's end-of-lecture exercises (e.g. adding `exp`, `log`, alternative loss
-  functions).
+Ran the exact same single-neuron computation in PyTorch to confirm the from-scratch engine
+is mathematically correct, not just internally consistent.
+
+```python
+import torch
+
+x1 = torch.Tensor([2.0]).double(); x1.requires_grad = True
+x2 = torch.Tensor([0.0]).double(); x2.requires_grad = True
+w1 = torch.Tensor([-3.0]).double(); w1.requires_grad = True
+w2 = torch.Tensor([1.0]).double(); w2.requires_grad = True
+b = torch.Tensor([6.8813735870195432]).double(); b.requires_grad = True
+
+n = x1*w1 + x2*w2 + b
+o = torch.tanh(n)
+o.backward()
+```
+
+- `.double()` — PyTorch tensors default to 32-bit; cast to 64-bit to match Python's native
+  `float` precision used throughout the `Value` engine, for a fair comparison.
+- `requires_grad = True` — has to be set explicitly per-tensor in PyTorch (a performance
+  choice, since not every tensor needs gradient tracking). In the `Value` engine, every
+  value tracks gradients by default with no equivalent flag.
+
+Results, side by side:
+
+| | `Value` engine | PyTorch |
+|---|---|---|
+| `o` | `0.7071067811865476` | `0.7071066904050358` |
+| `x1.grad` | `-1.5` | `-1.5000003851533106` |
+| `w1.grad` | `1.0` | `1.0000002567688737` |
+| `x2.grad` | `0.5` | `0.5000001283844369` |
+| `w2.grad` | `0.0` | `0.0` |
+
+Matched to ~6 decimal places — the tiny remaining differences are just floating-point
+precision/computation-order artifacts, not a real discrepancy. Confirms: the ~50-line
+`Value` engine implements the same core math as PyTorch's autograd (every number is a graph
+node, every operation has a local gradient rule, backward applies the chain rule root to
+leaves) — PyTorch just adds massive engineering on top (C++/CUDA, GPU parallelism,
+distributed training) for scale, not different math.
+
+## 25. Status: `01-micrograd` complete
+
+End-to-end pipeline built entirely from scratch and verified at every stage:
+numerical gradient → `Value` autograd engine → manual then automatic backward
+(topological sort) → `tanh` nonlinearity → gradient descent on a single neuron →
+`Neuron`/`Layer`/`MLP` architecture → `parameters()` → full training loop (loss `4.78` →
+`0.05` over 20 iterations on a toy dataset) → graphviz visualization of the computational
+graph → cross-checked against real PyTorch, results matched.
+
+Remaining nice-to-haves (not blocking, can revisit later): a few more operator overloads
+(`__rmul__`, `__truediv__`) for full parity with the video's `Value`, and the video's
+end-of-lecture exercises (`exp`, `log`, alternative loss functions).
