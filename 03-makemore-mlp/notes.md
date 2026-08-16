@@ -186,16 +186,141 @@ this is full-batch (slow per step). The 3-character-context MLP has strictly mor
 information available than bigram's 1-character context, so it should be able to surpass
 bigram's score with more training — that's the next thing to verify.
 
-## 10. Open questions / next steps
+## 11. Minibatch training — much faster iteration
 
-- Full-batch training (all 228K examples per step) is slow — the video introduces
-  minibatches (random subsets per step) for much faster iteration; try that next.
-- Need a systematic way to pick a good learning rate (video: "finding a good initial
-  learning rate") rather than guessing a fixed value like `0.1`.
-- Haven't split data into train/val/test yet — needed to check the model is actually
-  generalizing rather than overfitting the training set.
+Full-batch (all 228,146 examples per step) is accurate but slow. Switched to sampling a
+small random subset ("minibatch") of 32 examples per step:
+
+```python
+ix = torch.randint(0, X.shape[0], (32,))
+emb = C[X[ix]]
+...
+loss = F.cross_entropy(logits, Y[ix])
+```
+
+Each step now processes far less data, so many more iterations fit in the same time.
+Trade-off: the per-step loss becomes noisy (each minibatch is a different, small, random
+sample, so easy vs. hard minibatches produce very different loss values step to step) —
+the overall downward trend is what matters, not any single printed value. Ran 10,000
+iterations at `lr=0.1`; loss fluctuated between ~2.1 and ~2.8, already surpassing bigram's
+converged score (2.4541) at its better points.
+
+## 12. Finding a good learning rate systematically
+
+Rather than guessing a fixed learning rate, swept a wide logarithmic range and plotted loss
+against it:
+
+```python
+lre = torch.linspace(-3, 0, 1000)   # exponents from -3 to 0
+lrs = 10**lre                        # learning rates from 0.001 to 1.0
+
+lossi, lri = [], []
+for k in range(1000):
+    ix = torch.randint(0, X.shape[0], (32,))
+    ... # forward + backward as usual
+    lr = lrs[k]
+    for p in parameters:
+        p.data += -lr * p.grad
+    lri.append(lre[k].item())
+    lossi.append(loss.item())
+
+plt.plot(lri, lossi)
+```
+
+Used a logarithmic sweep (exponents, not raw values) because learning rate's effect isn't
+linear — the difference between 0.001 and 0.01 matters much more than between 0.5 and 0.51,
+so a log scale gives small values fair representation.
+
+Plot showed a "bowl" shape: loss stays in a reasonable ~2.0-2.5 band from `lr≈0.001` up
+through `lr≈0.3`, then shoots up sharply (to 4+ and unstable) as `lr` approaches 1.0 — too
+large a step overshoots and destabilizes training. Confirmed `lr≈0.1` (the value already
+being used) sits in a reasonable part of that range.
+
+## 13. Train / validation / test split
+
+**Why needed:** looking only at loss on the data the model was trained on can be
+misleading — a model can overfit (memorize training examples) and look great on that data
+while generalizing poorly to anything new. A held-out validation set the model never trains
+on reveals whether it actually learned generalizable patterns.
+
+```python
+def build_dataset(words):
+    block_size = 3
+    X, Y = [], []
+    for w in words:
+        context = [0] * block_size
+        for ch in w + '.':
+            ix = stoi[ch]
+            X.append(context)
+            Y.append(ix)
+            context = context[1:] + [ix]
+    return torch.tensor(X), torch.tensor(Y)
+
+random.seed(42)
+words_shuffled = words.copy()
+random.shuffle(words_shuffled)   # shuffle first — avoids a biased split if names.txt has
+                                    # any ordering (e.g. alphabetical)
+
+n1 = int(0.8 * len(words_shuffled))   # cutoff index for 80%
+n2 = int(0.9 * len(words_shuffled))   # cutoff index for 90%
+
+Xtr,  Ytr  = build_dataset(words_shuffled[:n1])    # 80% — train: updates model weights
+Xdev, Ydev = build_dataset(words_shuffled[n1:n2])   # 10% — dev/validation: monitor only,
+                                                       # used for tuning hyperparameters
+Xte,  Yte  = build_dataset(words_shuffled[n2:])      # 10% — test: touched once, at the end
+```
+
+`int(0.8 * len(...))` truncates a fractional index count (`25626.4` → `25626`) down to a
+valid integer list index. Verified split sizes: `(182625, 3)`, `(22655, 3)`, `(22866, 3)`
+— summing back to 228,146.
+
+**Bug hit along the way:** typo'd `parameteres` (extra/misplaced letters) instead of
+`parameters` when building the parameter list — the training loop's `for p in parameters`
+then silently referenced a *different, stale* `parameters` variable from an earlier cell
+run, producing the same `NoneType` gradient error as before but for a completely different
+reason. Lesson: this class of bug (subtly misspelled variable name shadowing/missing the
+intended one) can look identical to other bugs in the error message, so check spelling
+carefully, especially after a Restart & Run All didn't fix an already-diagnosed issue.
+
+## 14. Why the hidden layer is *wider* than the input, then narrows to the output
+
+Input (6 dims) is just raw data — the 3 characters' embeddings side by side, carrying no
+processed meaning yet. The hidden layer (100 dims) is where the network actually
+"thinks" — more neurons means more capacity to simultaneously detect different patterns in
+that raw input (e.g., one neuron might end up sensitive to "does this end in a vowel",
+another to some statistically useful but human-indescribable pattern, etc.). A hidden layer
+the same size as the input would only allow a limited transformation of the data; going
+wider lets the network build a much richer internal representation before making a
+decision. The output layer (27 dims) then compresses that rich internal representation back
+down to exactly the number of things being decided between (27 possible next characters) —
+the "final verdict" step. Hidden layer width is a design choice / hyperparameter (not
+determined by input or output size) that trades off capacity: too narrow risks
+underfitting, too wide risks overfitting.
+
+## 15. Training with a proper split
+
+Retrained from scratch, sampling minibatches only from `Xtr`/`Ytr` (never touching
+`Xdev`/`Ydev` during weight updates), 30,000 iterations at `lr=0.1`. Then measured real
+(non-minibatch) loss on the full train set and the untouched dev set:
+
+```
+train loss: 2.3136
+dev loss:   2.3201
+```
+
+The two are very close (diff ≈ 0.0065) — strong evidence the model is genuinely learning
+generalizable structure, not memorizing the training set (memorization would show up as a
+much lower train loss than dev loss). Both numbers also beat bigram's `2.4541`, confirming
+the 3-character-context MLP does capture more useful structure than bigram's 1-character
+context, as hypothesized.
+
+## 16. Open questions / next steps
+
 - Try a larger hidden layer and larger embedding size (video experiments with both) and see
-  how loss responds.
-- Visualize the learned 2D character embeddings once trained — check whether
-  similar-behaving characters (e.g. vowels) cluster together, as theorized in section 3.
-- Sample new names from the trained model and compare against bigram's output quality.
+  how train/dev loss respond.
+- Visualize the learned 2D character embeddings — check whether similar-behaving characters
+  (e.g. vowels) cluster together.
+- Sample new names from this trained model and compare quality against bigram's output.
+- Only evaluate on the test set once, at the very end, after all hyperparameter tuning is
+  done via the dev set — using test data to tune anything would leak information and make
+  the final evaluation optimistic/invalid.
