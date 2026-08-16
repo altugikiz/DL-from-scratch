@@ -314,13 +314,73 @@ much lower train loss than dev loss). Both numbers also beat bigram's `2.4541`, 
 the 3-character-context MLP does capture more useful structure than bigram's 1-character
 context, as hypothesized.
 
-## 16. Open questions / next steps
+## 17. Sampling from the trained MLP
 
-- Try a larger hidden layer and larger embedding size (video experiments with both) and see
-  how train/dev loss respond.
-- Visualize the learned 2D character embeddings — check whether similar-behaving characters
-  (e.g. vowels) cluster together.
-- Sample new names from this trained model and compare quality against bigram's output.
-- Only evaluate on the test set once, at the very end, after all hyperparameter tuning is
-  done via the dev set — using test data to tune anything would leak information and make
-  the final evaluation optimistic/invalid.
+Same overall sampling loop as bigram (start with an empty context, repeatedly sample the
+next character, stop at `.`), but now the context is a sliding 3-character window run
+through the trained embedding → hidden layer → softmax pipeline each step:
+
+```python
+g = torch.Generator().manual_seed(2147483647)
+for _ in range(20):
+    out = []
+    context = [0] * block_size
+    while True:
+        emb = C[torch.tensor([context])]
+        h = torch.tanh(emb.view(1, -1) @ W1 + b1)
+        logits = h @ W2 + b2
+        probs = F.softmax(logits, dim=1)
+        ix = torch.multinomial(probs, num_samples=1, generator=g).item()
+        context = context[1:] + [ix]
+        out.append(ix)
+        if ix == 0:
+            break
+    print(''.join(itos[i] for i in out))
+```
+
+**Why `tanh` on `h` but not on `logits`:** `tanh` (a nonlinearity) is needed on the hidden
+layer so stacking layers actually adds expressive power — without it, layered linear
+operations collapse back into one linear function. The final layer producing `logits`
+deliberately skips this: it's about to go through `softmax` (built on `exp`), which does its
+own nonlinear transform, and squashing logits into `(-1,1)` with `tanh` beforehand would
+dull the score differences softmax relies on to sharply separate character probabilities.
+General pattern: nonlinearities go between layers to enable depth; the final output layer is
+typically left "raw," feeding whatever transform (softmax, sigmoid, etc.) is appropriate for
+the task.
+
+## 18. Comparing generated names: bigram vs. MLP
+
+Bigram (1-character context) samples: `cexze, momasurailezitynn, konimittain, llayn, ka,
+da, staiyaubrtthrigotai, moliellavo, ke, teda`
+
+MLP (3-character context, trained) samples: `dex, daidaller, ile, kayde, dinichana, nylla,
+kyn, tar, samiyah, jansi, iota, mic, jen, kaugk, treda, kamerle, sadey, niaviyny, fols,
+milli`
+
+Clear qualitative jump: MLP outputs are consistently reasonable name-lengths (bigram
+produced some absurdly long/malformed ones like `momasurailezitynn`), and several MLP
+outputs (`samiyah`, `jansi`, `milli`, `treda`, `iota`) look strikingly close to real names.
+Some outputs are still awkward (`kaugk`, `niaviyny`) — expected, since this is still only a
+3-character context with a modest 100-unit hidden layer. The improvement directly
+demonstrates the thesis from section 1: more context lets the model capture a word's overall
+shape (length, syllable structure) rather than just very local, 1-character-back
+transitions — the same underlying reason production language models use much longer
+context windows.
+
+## 19. Status: `03-makemore-mlp` complete
+
+Built, end to end: multi-character context windows (sliding 3-char window) → learned
+character embeddings (replacing one-hot) → hidden layer with `tanh` → output layer →
+`F.cross_entropy` loss → fixed a bad weight-initialization bug (E02) → minibatch training →
+systematic learning-rate search → proper train/val/test split confirming genuine
+generalization (train 2.3136 vs dev 2.3201, both beating bigram's 2.4541) → sampled new
+names and confirmed a clear qualitative improvement over the bigram model.
+
+Remaining nice-to-haves (not blocking, can revisit later): visualize the learned 2D
+embeddings (check whether similar characters, e.g. vowels, cluster), experiment with larger
+hidden layer / embedding sizes (video does both), and only touch the held-out test set once
+at the very end of any further tuning.
+
+Next in the series: move beyond a fixed-size context window (currently hardcoded at 3)
+toward architectures that handle variable-length context more naturally — RNN, then
+Transformer.
