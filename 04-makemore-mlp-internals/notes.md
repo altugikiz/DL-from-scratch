@@ -106,19 +106,141 @@ but still well above the healthy target (video aims for closer to ~5%). Loss sta
 essentially the same (`3.333`), since fixing saturation is about gradient health / trainability
 going forward, not the loss value at this single snapshot.
 
-## 5. Open questions / next steps
+## 6. Kaiming init — the mathematically principled scale
 
-- `0.2` for `W1`'s scale was a guessed value, not derived — need to work through the
-  mathematically principled way to pick this scale ("Kaiming init," per the video), rather
-  than trial and error.
-- Saturation is still too high (36% vs a healthy ~5%) — Kaiming init should get this much
-  closer to healthy.
-- Main topic of the video not yet reached: **Batch Normalization** — normalizing each
-  layer's pre-activations during training so this kind of careful, fragile initialization
-  tuning becomes far less necessary.
-- Later in the video: visualizing forward-pass activation statistics, backward-pass gradient
-  statistics, and the "update:data ratio" as standard diagnostic tools for monitoring
-  network health during training.
-- Also later: rewriting the model using PyTorch's `nn.Linear` / `nn.BatchNorm1d` /
-  `nn.Tanh` layer classes instead of manually managed tensors — closer to how real PyTorch
-  code is typically written.
+Instead of guessing a scale factor for `W1` by trial and error, derived it: `hpreact` is a
+sum of `fan_in` (30, here) independent weighted terms. Variances of independent random
+variables add when summed, so summing `fan_in` terms roughly multiplies variance by
+`fan_in`, and standard deviation by `sqrt(fan_in)`. To keep `hpreact`'s spread from growing
+with `fan_in`, scale the weights down by the inverse: `W ~ randn * (1/sqrt(fan_in))`.
+
+```python
+fan_in = n_embd * block_size   # 30
+W1_scale = fan_in ** -0.5       # ≈ 0.1826
+```
+
+Notably close to the `0.2` guessed earlier by trial and error — the guess happened to be
+good, but now the reasoning behind the right scale is understood rather than assumed.
+
+**Result was underwhelming on its own:** loss `3.3318` (fine, expected), but saturation
+ratio only dropped to `0.3237` (32.4%) — still far from the ~5% target. **Why Kaiming init
+alone isn't a full fix:** it controls the *average* variance of `hpreact`, but individual
+values are still drawn from a random distribution — some will land in the tail (e.g. |x| > 2)
+purely by chance, and `tanh` already saturates noticeably past that point. More importantly,
+this kind of careful initial-scale tuning only holds at the very start of training — as
+weights update over many steps, the distribution of `hpreact` can drift again, and manually
+re-balancing this by hand becomes impractical, especially as networks get deeper. This is
+the motivation for Batch Normalization.
+
+## 7. Batch Normalization
+
+**Core idea:** instead of hoping initialization keeps `hpreact` well-scaled, force it to
+have mean 0 and std 1 on every forward pass, by explicitly normalizing it right before the
+nonlinearity:
+
+```python
+normalized = (hpreact - hpreact.mean(0, keepdim=True)) / hpreact.std(0, keepdim=True)
+```
+
+`mean(0, keepdim=True)` / `std(0, keepdim=True)` compute per-neuron statistics across the
+batch dimension (dim 0 = examples) — for each of the `n_hidden` neurons, the mean/std over
+all examples in the current minibatch.
+
+**But forcing an exact mean-0/std-1 every time removes the network's ability to choose a
+different scale/shift if that's actually useful for learning.** Fix: after normalizing, add
+two learnable parameters — `bngain` (scale) and `bnbias` (shift) — initialized to have no
+effect (`gain=1`, `bias=0`), letting gradient descent adjust them if a different
+scale/offset turns out to help:
+
+```python
+bngain = torch.ones((1, n_hidden))
+bnbias = torch.zeros((1, n_hidden))
+hpreact = bngain * (hpreact - hpreact.mean(0, keepdim=True)) / hpreact.std(0, keepdim=True) + bnbias
+```
+
+Also added `(5/3)` as an extra scaling factor on `W1`'s Kaiming-init scale — a `tanh`-specific
+gain constant used alongside Kaiming init in the video.
+
+Total parameters grew from 11,897 to **12,297** (`+200` for `bngain`, `+200` for `bnbias`,
+matching `n_hidden=200`).
+
+## 8. Training with Batch Norm + learning rate decay
+
+```python
+max_steps = 30000
+for i in range(max_steps):
+    ix = torch.randint(0, Xtr.shape[0], (32,), generator=g)
+    Xb, Yb = Xtr[ix], Ytr[ix]
+
+    emb = C[Xb]
+    embcat = emb.view(emb.shape[0], -1)
+    hpreact = embcat @ W1 + b1
+    hpreact = bngain * (hpreact - hpreact.mean(0, keepdim=True)) / hpreact.std(0, keepdim=True) + bnbias
+    h = torch.tanh(hpreact)
+    logits = h @ W2 + b2
+    loss = F.cross_entropy(logits, Yb)
+
+    for p in parameters:
+        p.grad = None
+    loss.backward()
+
+    lr = 0.1 if i < 15000 else 0.01   # learning rate decay: large steps early, fine-tune later
+    for p in parameters:
+        p.data += -lr * p.grad
+```
+
+Loss went from `3.3147` (iter 0) down into the `~2.0-2.4` range by iter 30000, with visibly
+less noisy fluctuation after the LR drop at iter 15000.
+
+**Evaluating with Batch Norm requires care:** during training, each minibatch normalizes
+using *its own* mean/std. But evaluation runs over a full split at once, not a small
+minibatch — so a consistent mean/std needs to be used instead of ad-hoc per-call statistics.
+Used the simplest approach here: compute the *entire training set's* `hpreact` mean/std once
+(under `torch.no_grad()`, since no gradients are needed for this) and reuse those fixed
+statistics for all evaluation:
+
+```python
+with torch.no_grad():
+    emb = C[Xtr]
+    embcat = emb.view(emb.shape[0], -1)
+    hpreact = embcat @ W1 + b1
+    hpreact_mean = hpreact.mean(0, keepdim=True)
+    hpreact_std = hpreact.std(0, keepdim=True)
+```
+
+(Note: a running mean/std updated incrementally during training is the more standard
+approach in practice, not yet implemented here.)
+
+## 9. Result: Batch Norm's measurable effect
+
+| | 03-makemore-mlp (no BatchNorm) | 04 (with BatchNorm) |
+|---|---|---|
+| Train loss | 2.3136 | **2.1589** |
+| Dev loss | 2.3201 | **2.1724** |
+
+Both dropped by about 0.15, and train/dev remain close (diff 0.0135) — confirms the
+improvement is genuine generalization gain, not new overfitting. Batch Norm delivered this
+by (1) largely fixing the saturated-tanh problem (forcing `hpreact` into a healthy range
+every forward pass, most neurons stay trainable), (2) making the network much less sensitive
+to exact initialization scale (the normalization compensates for imperfect init
+automatically), and (3) keeping inter-layer signal magnitudes more stable throughout
+training, letting gradient descent proceed more efficiently.
+
+## 10. Open questions / next steps
+
+- Replace the "compute train-set stats once at the end" evaluation approach with a proper
+  running mean/std tracked incrementally *during* training (the standard practice) —
+  current approach works but is a simplification.
+- Video covers additional diagnostic visualizations not yet done here: forward-pass
+  activation statistics across layers, backward-pass gradient statistics, and "update:data
+  ratio" over time — standard tools for monitoring a deep network's training health.
+- Video also rewrites this same model using PyTorch's `nn.Linear` / `nn.BatchNorm1d` /
+  `nn.Tanh` classes ("PyTorch-ifying") instead of manually managed tensors — worth doing to
+  get closer to idiomatic PyTorch code.
+- E01 exercise (from video): try initializing all weights and biases to exactly zero and
+  observe/explain the partial-training behavior that results.
+- E02 exercise: after training a small BatchNorm MLP, "fold" the batchnorm gamma/beta into
+  the preceding linear layer's weights and biases, and verify the folded version produces
+  identical forward-pass output — showing BatchNorm's training-time-only role.
+- Residual connections and the Adam optimizer are flagged in the video as topics for a later
+  session, not covered here.
