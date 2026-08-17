@@ -226,6 +226,96 @@ to exact initialization scale (the normalization compensates for imperfect init
 automatically), and (3) keeping inter-layer signal magnitudes more stable throughout
 training, letting gradient descent proceed more efficiently.
 
+## 11. Batch Norm, explained from first principles (follow-up deep dive)
+
+Revisited Batch Norm after the initial pass felt too abstract — worked through it with a
+concrete 4-example numeric walkthrough instead of just formulas.
+
+**The problem, restated simply:** `hpreact = x1*w1 + ... + x30*w30 + b` is a sum of many
+terms, so its scale is not naturally controlled — it can easily land far from 0 (e.g. `8.0`,
+`9.18`), and `tanh` saturates hard past roughly `|x| > 2`, killing that neuron's gradient.
+
+**Batch Norm's core move: instead of *hoping* the raw scale stays reasonable, force it into
+a safe range every single forward pass, by measuring and correcting it on the spot.**
+
+Worked through a toy example — 4 examples in a minibatch, one neuron, raw `hpreact` values
+`[8.0, 2.0, 6.0, 4.0]` (all large, saturation risk):
+
+1. Compute the mean across the batch: `(8+2+6+4)/4 = 5.0`
+2. Compute the std across the batch: `≈2.24`
+3. Standardize each value: `(x - mean) / std` → `[1.34, -1.34, 0.45, -0.45]`
+
+Result: guaranteed mean-0, std-1 output, *regardless of what the raw values were* — the
+large, saturation-prone values `[8,2,6,4]` become small, tanh-safe values. This is why the
+statistics need to be computed over multiple examples at once (a "batch"): mean/std of a
+single value is undefined in a useful sense (std of one number is 0, causing a `0/0` divide
+in the normalization formula) — normalization is only meaningful across a group.
+
+**Why not just always force mean-0/std-1 forever, with no escape hatch?** Because sometimes
+a wider or shifted range might genuinely help the network for a particular problem — hard-
+forcing normalization removes that flexibility. Fix: after normalizing, apply two learnable
+parameters:
+
+```
+final = gamma * normalized + beta
+```
+
+`gamma` (scale) and `beta` (shift), initialized to have zero effect (`gamma=1`, `beta=0`),
+so training starts from "just the safe, normalized version" but gradient descent can learn
+to stretch/shift it later if that reduces loss.
+
+**Batch Norm's three concrete benefits, restated plainly:**
+1. Prevents saturation — `hpreact` is kept in a safe range every forward pass, so neurons
+   stay trainable instead of freezing.
+2. Makes exact initialization scale far less critical — even an imperfectly-scaled `W1` gets
+   auto-corrected by the normalization step each time.
+3. Keeps signal magnitudes stable *throughout* training, not just at initialization — as
+   weights drift during training, Batch Norm re-corrects the scale every single step, so
+   drift doesn't accumulate.
+
+**Batch requirement, and what this means for evaluation:** because computing a meaningful
+mean/std needs multiple examples, Batch Norm can't run on a single example in isolation
+(mean of 1 number = itself, std = 0, causing a divide-by-zero). During training this is
+naturally satisfied (minibatches of 32). During evaluation/inference on a single example
+(e.g. generating one name), there's no batch to compute stats from — hence why this project
+precomputed fixed mean/std over the *entire* training set (section 8) and reused those as a
+stable reference at evaluation time, rather than trying to compute per-example statistics.
+
+## 12. Visualization tools — activation and gradient histograms
+
+**Activation histogram** — plot the distribution of `h` (post-tanh hidden layer output)
+across all neurons and examples in a batch:
+
+```python
+plt.hist(h.view(-1).tolist(), 50)
+```
+
+What to look for: if the histogram piles up almost entirely at the extremes (near -1 and
++1) with an empty middle, that's a strong visual sign of widespread saturation. Result here:
+a moderate uptick at both ends (~255 and ~225 count in the outermost bins) but the middle
+region (-0.5 to 0.5) is still meaningfully populated (~85-130 count per bin) — a "partially
+improved, not perfectly healthy" picture. Matches expectations: Batch Norm greatly reduces
+saturation but doesn't eliminate it entirely.
+
+**Gradient histogram** — plot the distribution of `h.grad` (gradient flowing back into the
+hidden layer) after a backward pass:
+
+```python
+h.retain_grad()   # h is a non-leaf tensor (output of tanh), so its .grad isn't kept by
+                    # default — needed this call (inside the forward pass, right after
+                    # h = torch.tanh(hpreact)) before .grad becomes accessible
+plt.hist(h.grad.view(-1).tolist(), 50)
+```
+
+Result: a smooth, symmetric bell-shaped distribution centered at 0, with no sharp "needle"
+spike exactly at zero. This is the healthy pattern — a sharp needle at 0 would indicate most
+neurons carry essentially no gradient signal (the saturated-neuron failure mode from section
+4). The smooth spread here confirms most neurons still carry meaningful, usable gradient.
+
+**Together, these two plots give a before/after-style health check:** activations show mild
+residual saturation, but gradients show the network is still learning effectively overall —
+consistent with Batch Norm being a large but not total fix.
+
 ## 10. Open questions / next steps
 
 - Replace the "compute train-set stats once at the end" evaluation approach with a proper
