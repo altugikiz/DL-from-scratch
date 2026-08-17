@@ -316,6 +316,73 @@ neurons carry essentially no gradient signal (the saturated-neuron failure mode 
 residual saturation, but gradients show the network is still learning effectively overall —
 consistent with Batch Norm being a large but not total fix.
 
+## 13. Viz #3 — parameter gradient statistics
+
+Instead of looking at neuron *output* statistics (h and h.grad), looked at the *weights
+themselves* — specifically, each 2D weight matrix's gradient distribution and its
+"grad:data ratio" (gradient's std relative to the parameter's own std):
+
+```python
+for i, p in enumerate(parameters):
+    t = p.grad
+    if p.ndim == 2:   # only look at weight matrices (C, W1, W2), not 1D biases
+        print('weight %10s | mean %+f | std %e | grad:data ratio %e' % (
+            tuple(p.shape), t.mean(), t.std(), t.std() / p.std()))
+```
+
+Result (end of training):
+```
+C  (27,10)  grad:data ratio 0.0135
+W1 (30,200) grad:data ratio 0.0352
+W2 (200,27) grad:data ratio 0.1354   ← notably higher than the others
+bngain (1,200) 0.0612
+bnbias (1,200) 0.1098
+```
+
+**What this ratio means:** how large the update to a parameter is, relative to the
+parameter's own current magnitude. `W2` at 0.1354 means its gradient-driven update at this
+step is roughly 13.5% of its own scale — much more aggressive than `C`'s 1.35%. Different
+parameter types (embeddings, weight matrices, batchnorm scale/shift) naturally have
+different gradient "personalities" — not inherently wrong, but worth monitoring, since a
+wildly disproportionate update rate for one layer can destabilize training. This motivates
+tracking the ratio *over time*, not just at one snapshot (next section).
+
+## 14. Viz #4 — update:data ratio over the whole training run
+
+Modified the training loop to record, at every iteration, each parameter's
+`(lr * grad).std() / p.data.std()` on a log10 scale:
+
+```python
+ud = []
+for i in range(max_steps):
+    ... forward + backward as usual ...
+    lr = 0.1 if i < 15000 else 0.01
+    with torch.no_grad():
+        for p in parameters:
+            p.data += -lr * p.grad
+        ud.append([((lr * p.grad).std() / p.data.std()).log10().item() for p in parameters])
+```
+
+Plotted each 2D parameter's ratio over all 30,000 iterations, with a reference line at
+`log10(ratio) = -3` (i.e. ratio ≈ 1/1000), which the video suggests as a healthy target.
+
+**Observations:**
+- For the first 15,000 iterations (`lr=0.1`), most parameters sat somewhat above the -3
+  reference line (roughly -1.9 to -3.0) — some (like `W2`, embedding `C`) more aggressively
+  updated than others.
+- At iteration 15000, when `lr` drops from `0.1` to `0.01` (a 10x reduction), every
+  parameter's ratio visibly drops by about 1 unit on the log scale (i.e. ~10x smaller
+  update) — expected, since the ratio is directly proportional to `lr`.
+- After the drop, `C` (embedding) settled around `-4.0`, noticeably *below* the healthy
+  reference line — suggesting the embedding layer may have been updating too slowly in the
+  second half of training, essentially near-frozen relative to what might be ideal.
+
+**Practical takeaway:** a single global learning rate, even with decay, doesn't treat every
+parameter equally — some layers can end up updating too aggressively, others too slowly,
+at the same shared `lr`. This is part of the motivation for more advanced optimizers (e.g.
+Adam, flagged in the video as a later topic) that adapt the effective learning rate
+per-parameter automatically, rather than relying on one global schedule for everything.
+
 ## 10. Open questions / next steps
 
 - Replace the "compute train-set stats once at the end" evaluation approach with a proper
