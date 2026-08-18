@@ -485,6 +485,44 @@ Result: loss `3.2662` (iter 0) down to the `~1.9-2.3` range by iter 27000 — co
 the manually-written Batch Norm version, as expected (same math, different code
 organization).
 
+## 16. The fully-linear case — removing Tanh entirely
+
+Experiment: remove `Tanh()` from the layer stack, keeping only
+`Linear → BatchNorm1d → Linear`, and train the same way.
+
+```python
+layers = [
+    torch.nn.Linear(n_embd * block_size, n_hidden, bias=False),
+    torch.nn.BatchNorm1d(n_hidden),
+    # Tanh removed
+    torch.nn.Linear(n_hidden, vocab_size),
+]
+```
+
+**Prediction based on earlier theory:** stacking two `Linear` layers with nothing
+nonlinear between them should mathematically collapse into one single linear
+transformation — depth should add no expressive power.
+
+**Result:** loss settled in the `~2.1-2.5` range over 30,000 iterations — worse than the
+`Tanh`-included version (`~1.9-2.3`), but *not* a total collapse into bigram-only
+performance either. Notably close to bigram's converged score (`~2.45`), which makes sense:
+without a real nonlinearity, the model can only learn something closer to a simple,
+near-linear relationship, similar in character to bigram's simple statistical relationship.
+
+**Why doesn't it collapse completely, given the "stacked linears = one linear" theory?**
+Because `BatchNorm1d` isn't purely linear itself: its normalization divides by the current
+minibatch's standard deviation, which changes from batch to batch — this data-dependent
+division introduces a mild nonlinear element into the `Linear → BatchNorm1d → Linear` chain,
+so it doesn't fully degenerate into a single linear map the way two bare `Linear` layers
+back-to-back would. The network still learns *something*, just far less expressively than
+with a real nonlinearity like `Tanh` providing genuine bends/kinks in the function it can
+represent.
+
+**Takeaway:** removing the nonlinearity doesn't break training outright (thanks to
+BatchNorm's incidental nonlinear behavior), but it clearly caps how much the network can
+learn — concretely demonstrating, with real numbers, why nonlinearities are necessary for
+depth to actually pay off (not just a theoretical claim from earlier sections).
+
 ## 10. Open questions / next steps
 
 - Replace the "compute train-set stats once at the end" evaluation approach with a proper
