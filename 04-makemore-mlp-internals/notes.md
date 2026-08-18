@@ -560,6 +560,82 @@ characters' rows can start differentiating even while `W1` stays symmetric) — 
 small amount of learning that does happen, capped well below what normal random
 initialization achieves.
 
+## 18. E02 — folding BatchNorm into the preceding Linear layer
+
+Exercise: after training a network with `Linear → BatchNorm1d`, show that the trained
+BatchNorm's effect can be mathematically absorbed into the preceding Linear layer's weights
+and bias, producing an equivalent single Linear layer — useful because it means BatchNorm
+adds zero cost at inference time once training is done.
+
+**Worked through the algebra with a tiny scalar example first.** Two steps applied in
+sequence:
+```
+1. y = x*w + b                              (Linear)
+2. result = gamma*(y - mean)/std + beta      (BatchNorm, with FIXED post-training gamma/beta/mean/std)
+```
+Substituting and regrouping terms in `x`:
+```
+result = x*(gamma*w/std) + (gamma*b/std - gamma*mean/std + beta)
+              └── w_new ──┘    └──────────── b_new ────────────┘
+```
+So `result = x*w_new + b_new` — a single linear formula. Verified numerically with
+`w=3, b=2, gamma=2, beta=1, mean=5, std=4, x=10`: both the two-step computation and the
+folded single-step computation gave `14.5`, confirming the algebra.
+
+**Why this only works *after* training, not during:** during training, `mean`/`std` are
+recomputed per-minibatch (they change every step), so there's no fixed pair of numbers to
+algebraically fold into `W`/`b` — the "constant" assumption the derivation relies on doesn't
+hold yet. Only once training is done and BatchNorm switches to using fixed running
+statistics does the whole chain become genuinely linear and foldable.
+
+**Applied to the real (200-dim) model:**
+
+```python
+layers[1].eval()   # switch BatchNorm to eval mode — uses fixed running_mean/running_var,
+                     # not per-minibatch statistics, which is required for folding to be valid
+
+lin = layers[0]      # trained first Linear (bias=False, so treated as b=0)
+bn = layers[1]        # trained BatchNorm1d
+gamma = bn.weight
+beta = bn.bias
+mean = bn.running_mean
+std = (bn.running_var + bn.eps).sqrt()
+
+W_new = lin.weight * (gamma / std).unsqueeze(1)   # unsqueeze(1): (200,) -> (200,1) so each
+                                                     # output row is scaled by its own gamma/std
+b_new = beta - (mean * gamma / std)
+
+folded_linear = torch.nn.Linear(n_embd * block_size, n_hidden)
+with torch.no_grad():
+    folded_linear.weight.copy_(W_new)
+    folded_linear.bias.copy_(b_new)
+```
+
+Ran the original chain (`Linear → BatchNorm(eval) → Tanh → Linear`) and the folded chain
+(`folded_linear → Tanh → Linear`) on the same 5 test examples. Both produced identical
+output: `[-2.3088, 1.6278, 0.6228, 0.7097, 0.7373]` for the first example's first 5 logits —
+byte-for-byte match, confirming the fold is mathematically exact.
+
+**Practical significance:** this is a real technique used in production models (e.g.
+ResNet) — after training, BatchNorm layers can be folded into their preceding
+Linear/Conv layers, producing a smaller, faster model for inference with zero accuracy loss,
+since BatchNorm's only real job was stabilizing *training*, not adding any lasting
+representational capability the folded weights don't already capture.
+
+## 19. Status: `04-makemore-mlp-internals` complete
+
+Covered, end to end: diagnosing and fixing a broken initial loss, diagnosing and partially
+fixing saturated tanh, deriving Kaiming init from first principles, implementing Batch
+Normalization by hand and understanding it via a concrete numeric walkthrough, four
+diagnostic visualizations (activation histogram, gradient histogram, parameter gradient
+stats, update:data ratio over time), rewriting the model with PyTorch's built-in layer
+classes (`nn.Linear`, `nn.BatchNorm1d`, `nn.Tanh`), an empirical fully-linear-network
+experiment, and both video exercises (E01: zero-init symmetry problem, E02: folding
+BatchNorm into a preceding Linear layer).
+
+Deliberately left as future topics (per the video itself): residual connections and the
+Adam optimizer.
+
 ## 10. Open questions / next steps
 
 - Replace the "compute train-set stats once at the end" evaluation approach with a proper
