@@ -523,6 +523,43 @@ BatchNorm's incidental nonlinear behavior), but it clearly caps how much the net
 learn — concretely demonstrating, with real numbers, why nonlinearities are necessary for
 depth to actually pay off (not just a theoretical claim from earlier sections).
 
+## 17. E01 — initializing everything to exactly zero
+
+Exercise from the video: what happens if all weights and biases start at exactly zero
+(instead of random)? Predicted one of three outcomes: trains fine, doesn't train at all, or
+trains only partially with poor final performance.
+
+```python
+C = torch.zeros((vocab_size, n_embd))
+W1 = torch.zeros((n_embd * block_size, n_hidden))
+b1 = torch.zeros(n_hidden)
+W2 = torch.zeros((n_hidden, vocab_size))
+b2 = torch.zeros(vocab_size)
+```
+
+Trained 1000 iterations (no BatchNorm, simple architecture, for clarity). Result: loss went
+from `3.2958` down to only `~2.8-3.1`, essentially plateauing there — far above bigram's
+2.4541 and the normal-init MLP's ~2.3. This matches outcome (3): partial training, poor
+final performance — not a full failure, but a severe cap on what's learned.
+
+**Why:** with `W1` all zeros, every hidden neuron's pre-activation is `embcat @ [all zeros]
++ 0 = 0`, regardless of input — all 200 hidden neurons produce an identical (zero) output,
+making them completely indistinguishable from each other. During backward, because every
+neuron is in this same symmetric state, every row of `W1`'s gradient works out to be
+identical too — so all 200 neurons get updated in lockstep, in the same direction, by the
+same amount, throughout training. Effectively, a 200-neuron hidden layer behaves like it has
+the *functional capacity of just 1 neuron*, since none of them differentiate from each
+other. This "symmetry" is the core problem with zero-init, distinct from — but related in
+spirit to — the earlier saturated-tanh problem: both cases involve most of the network's
+capacity being unusable, just via different mechanisms (dead gradients vs. locked symmetry).
+
+Loss isn't perfectly flat/stuck at the theoretical `-log(1/27)` baseline, because the
+embedding table `C` and the final bias `b2` can still break some of this symmetry over
+training (character embeddings, in particular, are indexed per-character, so different
+characters' rows can start differentiating even while `W1` stays symmetric) — hence the
+small amount of learning that does happen, capped well below what normal random
+initialization achieves.
+
 ## 10. Open questions / next steps
 
 - Replace the "compute train-set stats once at the end" evaluation approach with a proper
