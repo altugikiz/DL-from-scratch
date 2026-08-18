@@ -383,6 +383,108 @@ at the same shared `lr`. This is part of the motivation for more advanced optimi
 Adam, flagged in the video as a later topic) that adapt the effective learning rate
 per-parameter automatically, rather than relying on one global schedule for everything.
 
+## 15. PyTorch-ifying — using built-in layer classes
+
+Rewrote the same architecture using PyTorch's own layer classes instead of manually
+managed tensors — closer to how real PyTorch code is typically written.
+
+**Core idea: each `nn.` class is a "box" that stores its own parameters internally and
+knows how to apply its own formula when called.**
+
+```python
+layer0 = torch.nn.Linear(30, 200, bias=False)
+```
+creates and stores a weight tensor (`layer0.weight`, shape `(200,30)`) internally — no need
+to manually create/track `W1` as a separate variable. Calling `layer0(embcat)` then
+automatically runs `embcat @ layer0.weight.T` (+bias if enabled) internally — the same
+computation as manually writing `embcat @ W1 + b1`, just packaged inside the layer object.
+
+```python
+layers = [
+    torch.nn.Linear(n_embd * block_size, n_hidden, bias=False),   # replaces W1, b1
+    torch.nn.BatchNorm1d(n_hidden),                                 # replaces bngain, bnbias, mean/std normalize
+    torch.nn.Tanh(),                                                 # replaces torch.tanh(...)
+    torch.nn.Linear(n_hidden, vocab_size),                           # replaces W2, b2
+]
+
+with torch.no_grad():
+    layers[-1].weight *= 0.1   # keep the final layer small at init, same reasoning as before
+
+parameters = [C] + [p for layer in layers for p in layer.parameters()]
+for p in parameters:
+    p.requires_grad = True
+```
+
+**Why 4 layers specifically — each has a distinct role:**
+- First `Linear` (30→200): transforms the raw flattened embedding into a rich, learnable
+  hidden representation ("thinking space").
+- `BatchNorm1d`: forces that layer's pre-activation output into a healthy range every
+  forward pass, preventing saturation.
+- `Tanh`: the nonlinearity — without it, stacking two `Linear` layers would collapse
+  mathematically into one single linear layer, making depth meaningless.
+- Final `Linear` (200→27): compresses the rich hidden representation down to one score per
+  possible next character — the "final decision" step.
+
+**Layer parameter signatures reflect what each layer type needs to know:**
+- `Linear(in_features, out_features)` needs both, since it changes dimensionality (must
+  build a weight matrix of the right shape).
+- `BatchNorm1d(num_features)` needs only one number, since it doesn't change dimensionality
+  (normalizes in place, same size in and out) — it just needs to know how many per-feature
+  gamma/beta pairs to track.
+- `Tanh()` needs nothing — it's a fixed mathematical function with no learnable parameters.
+
+**Forward pass collapses from 4 manually-written formula lines into one loop:**
+
+```python
+# before (manual):
+hpreact = embcat @ W1 + b1
+hpreact = bngain * (hpreact - hpreact.mean(0, keepdim=True)) / hpreact.std(0, keepdim=True) + bnbias
+h = torch.tanh(hpreact)
+logits = h @ W2 + b2
+
+# after (layer classes):
+x = embcat
+for layer in layers:
+    x = layer(x)
+```
+
+Each layer already "knows" its own formula, so the loop just feeds the previous layer's
+output into the next layer, layer by layer — mathematically identical result, but the code
+no longer grows linearly with the number of layers (adding a 10-layer network wouldn't need
+10 hand-written formula lines, just 10 entries in the `layers` list).
+
+Confirmed correctness: initial loss on a random minibatch was `3.2871`, matching the
+`~3.296` theoretical baseline (same as the manual version).
+
+**Training loop is otherwise unchanged** — same minibatch sampling, same
+zero-grad/backward/update steps, same learning rate decay schedule (`0.1` → `0.01` at
+iteration 15000). Only the forward-pass section differs.
+
+```python
+max_steps = 30000
+for i in range(max_steps):
+    ix = torch.randint(0, Xtr.shape[0], (32,), generator=g)
+    Xb, Yb = Xtr[ix], Ytr[ix]
+
+    emb = C[Xb]
+    x = emb.view(emb.shape[0], -1)
+    for layer in layers:
+        x = layer(x)
+    loss = F.cross_entropy(x, Yb)
+
+    for p in parameters:
+        p.grad = None
+    loss.backward()
+
+    lr = 0.1 if i < 15000 else 0.01
+    for p in parameters:
+        p.data += -lr * p.grad
+```
+
+Result: loss `3.2662` (iter 0) down to the `~1.9-2.3` range by iter 27000 — consistent with
+the manually-written Batch Norm version, as expected (same math, different code
+organization).
+
 ## 10. Open questions / next steps
 
 - Replace the "compute train-set stats once at the end" evaluation approach with a proper
