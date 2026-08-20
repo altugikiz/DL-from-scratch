@@ -150,6 +150,81 @@ Shape check: `(counts * dprobs)` is `(n, vocab_size)`; `.sum(1, keepdim=True)` c
 
 `cmp('counts_sum_inv', dcounts_sum_inv, counts_sum_inv)` → **exact: True, maxdiff: 0.0**.
 
+## 9. dcounts_sum — power rule through the inverse
+
+`counts_sum_inv = counts_sum**-1`. Worked through what `**-1` means concretely: it's just
+`1/x` (verified: `5**-1 = 1/5 = 0.2`). Recognized `counts_sum**-1` as an alternative way of
+writing `1/counts_sum`, chosen over direct division because differentiating a power/multiply
+is more familiar than deriving division's rule separately.
+
+Applied the power rule (`f(x)=x^n → f'(x)=n*x^(n-1)`) with `n=-1`:
+```
+d(counts_sum_inv)/d(counts_sum) = -1 * counts_sum^(-2) = -1/counts_sum²
+```
+
+```python
+dcounts_sum = (-counts_sum**-2) * dcounts_sum_inv
+```
+Both operands are `(n,1)`, so this is a simple element-wise multiply, no broadcasting
+subtlety.
+
+`cmp('counts_sum', dcounts_sum, counts_sum)` → **exact: True, maxdiff: 0.0**.
+
+## 10. dcounts — combining a broadcasting-multiply gradient and a sum's gradient
+
+`counts` is used in *two* places:
+```python
+counts_sum = counts.sum(1, keepdim=True)    # path 1
+probs = counts * counts_sum_inv              # path 2
+```
+Just like `b = a + a` in 01-micrograd, using a value in two places means its total gradient
+is the sum of the contributions from each path.
+
+**Path 2 (multiply, already-familiar pattern):**
+```python
+contribution_mult = counts_sum_inv * dprobs
+```
+
+**Path 1 (sum's backward — "distributing" a gradient) required extra work to build
+intuition for.** Key realization, worked through with a concrete tiny example
+(`counts[0]=[7,2,1]`, `counts_sum[0]=[10]`): increasing *any one* of `7`, `2`, or `1` by 1
+increases `counts_sum` by exactly 1 — all three terms affect the sum identically. So if
+`dcounts_sum[0] = 0.5` (nudging `counts_sum` by 1 changes loss by 0.5), then nudging *any*
+of the three original values by 1 has that same 0.5 effect on loss — each one independently
+"deserves" the full 0.5, not a fraction of it. This is the backward mirror of forward's
+"squeeze many values into one via sum": backward "distributes one gradient value out to
+many," each original position getting an identical copy of the incoming gradient.
+
+```python
+contribution_sum = torch.ones_like(counts) * dcounts_sum
+```
+
+**What `torch.ones_like(counts)` is actually doing, and why it's necessary (not just a
+readability choice):** `dcounts_sum` has shape `(n,1)` — one number per row — but the
+gradient contribution needed for `counts` must have shape `(n, vocab_size)` — one number per
+*column* too. A bare scalar `1` multiplied against `dcounts_sum` leaves it at `(n,1)`,
+still the wrong shape. `torch.ones_like(counts)` creates a template tensor already shaped
+`(n, vocab_size)`, filled with 1s; multiplying it by `dcounts_sum` triggers broadcasting,
+which copies each row's single `dcounts_sum` value across all `vocab_size` columns of that
+row — this is literally *how* a `(n,1)` gradient gets turned into an `(n,vocab_size)`
+gradient with identical values across each row (matching the "every term in the sum gets an
+identical copy" reasoning above). Without the `ones_like` template, there's no multiply
+operation to trigger the broadcast, and thus no mechanism to expand the shape.
+
+**Combined (sum of both paths' contributions):**
+```python
+dcounts = counts_sum_inv * dprobs + torch.ones_like(counts) * dcounts_sum
+cmp('counts', dcounts, counts)
+```
+→ **exact: True, maxdiff: 0.0**.
+
+**On the `cmp()` function itself:** takes a manually-computed gradient (`dt`) and the real
+PyTorch tensor (`t`, whose `.grad` was populated by an actual `loss.backward()` call via
+`retain_grad()`), and reports whether they match exactly, approximately (allowing for tiny
+floating-point differences), and the maximum absolute difference. This turns "did I derive
+this gradient correctly" from a guess into a definitive, checkable answer at every single
+step — essential for building confidence while working through a long manual derivation.
+
 ## 8. Open questions / next steps
 
 - Continue the backward chain: `dcounts`, `dnorm_logits`, `dlogit_maxes`, `dlogits`, then
