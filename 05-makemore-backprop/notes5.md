@@ -225,6 +225,91 @@ floating-point differences), and the maximum absolute difference. This turns "di
 this gradient correctly" from a guess into a definitive, checkable answer at every single
 step — essential for building confidence while working through a long manual derivation.
 
+## 11. dnorm_logits — exp()'s clean derivative
+
+`counts = norm_logits.exp()`. Since `d(exp(x))/dx = exp(x)` (the function is its own
+derivative), `counts` itself already *is* the local derivative:
+
+```python
+dnorm_logits = counts * dcounts
+```
+Shapes match exactly (`(n, vocab_size)` both), simple element-wise multiply.
+
+`cmp('norm_logits', dnorm_logits, norm_logits)` → **exact: True, maxdiff: 0.0**.
+
+## 12. Why `logit_maxes` exists — numerical stability, not a training-related choice
+
+Before diving into `dlogit_maxes`, clarified *why* `logit_maxes` is computed at all:
+```python
+logit_maxes = logits.max(1, keepdim=True).values
+norm_logits = logits - logit_maxes
+```
+This has nothing to do with what the model learns — it's purely a numerical safety trick.
+`exp()` of a large logit (e.g. `exp(500)`) can overflow to `inf`. Subtracting each row's max
+from every value in that row before calling `exp()` doesn't change softmax's final result
+(the shift cancels out during normalization — verified with a concrete example:
+`logits=[5,8,3]` gives identical final probabilities whether or not the max is subtracted
+first), but guarantees every value going into `exp()` is ≤ 0, so it can never overflow.
+Subtracting specifically the *max* (rather than any other value) guarantees this property.
+
+## 13. dlogit_maxes — subtraction's sign + broadcasting's sum, combined
+
+`norm_logits = logits - logit_maxes`. Worked through subtraction's local derivatives with a
+tiny numeric check: for `y = x - z`, nudging `x` up by 1 nudges `y` up by 1 (`local deriv =
++1`), but nudging `z` up by 1 nudges `y` *down* by 1 (`local deriv = -1`).
+
+So `logits` gets `+1 * dnorm_logits` (unchanged sign, just copied), while `logit_maxes` gets
+`-1 * dnorm_logits` (sign flipped) — but `logit_maxes`'s shape `(n,1)` doesn't match
+`dnorm_logits`'s shape `(n, vocab_size)`, because `logit_maxes` was broadcast during the
+subtraction (each row's single max value was reused across all `vocab_size` columns when
+computing `norm_logits`). Same broadcasting-sum pattern as `dcounts_sum` earlier: since one
+value fed into many outputs, its gradient contributions from every one of those outputs must
+be summed.
+
+```python
+dlogit_maxes = (-dnorm_logits).sum(1, keepdim=True)
+```
+
+`cmp('logit_maxes', dlogit_maxes, logit_maxes)` → **exact: True, maxdiff: 0.0**.
+
+## 14. dlogits (complete) — combining a copy-through and a max()-selection gradient
+
+`logits` is used in two places:
+```python
+norm_logits = logits - logit_maxes           # path 1, local deriv +1, already have this
+logit_maxes = logits.max(1, keepdim=True).values   # path 2, needs max()'s backward rule
+```
+
+**Path 2 required understanding `max()`'s backward rule from scratch, worked through with
+a concrete numeric experiment (not just asserted).** For `logits[0] = [5, 8, 3]`, max is 8
+(position 1). Nudging the non-max value `5` up by a tiny amount (`5.0001`) doesn't change
+the max at all (still 8) — so `5`'s local gradient contribution to the max is 0. Nudging
+the max value `8` up by a tiny amount (`8.0001`) changes the max by that *exact same* amount
+— so `8`'s local gradient contribution is 1. Conclusion: **only the position that was
+actually selected as the max carries any gradient; every other position gets exactly 0** —
+not because the max is special in some abstract sense, but because it's literally the only
+value that was used in computing the output; nudging an unused value can't affect a result
+that never depended on it.
+
+```python
+dlogits += F.one_hot(logits.max(1).indices, num_classes=logits.shape[1]) * dlogit_maxes
+```
+
+- `logits.max(1).indices` gives, per row, which column position held the max.
+- `F.one_hot(..., num_classes=logits.shape[1])` turns that index into a one-hot vector
+  (e.g. index 1 in a 3-wide row → `[0,1,0]`) — matching exactly the gradient pattern derived
+  by hand above.
+- Multiplying by `dlogit_maxes` places the real gradient value only at the max position,
+  zero elsewhere.
+- `+=` (not `=`) accumulates this onto the path-1 contribution already computed
+  (`dlogits = dnorm_logits.clone()`), since `logits` is used in two places.
+
+`logits.shape[1]` (rather than hardcoding `27`) reads the actual column count dynamically —
+same "don't hardcode a size that might change" reasoning as using `-1` in `.view()` or a
+`vocab_size` variable elsewhere.
+
+`cmp('logits', dlogits, logits)` → **exact: True, maxdiff: 0.0**.
+
 ## 8. Open questions / next steps
 
 - Continue the backward chain: `dcounts`, `dnorm_logits`, `dlogit_maxes`, `dlogits`, then
