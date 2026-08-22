@@ -310,6 +310,140 @@ same "don't hardcode a size that might change" reasoning as using `-1` in `.view
 
 `cmp('logits', dlogits, logits)` → **exact: True, maxdiff: 0.0**.
 
+## 15. Second Linear layer backward — dh, dW2, db2
+
+`logits = h @ W2 + b2`. Applying the general matrix-multiply backward rule derived earlier
+(`C = A @ B` → `A.grad = C.grad @ B.T`, `B.grad = A.T @ C.grad`), with the mapping
+`A=h, B=W2, C=logits`:
+
+```python
+dh = dlogits @ W2.T
+dW2 = h.T @ dlogits
+```
+
+Shape check (always worth doing explicitly): `h (32,64)`, `W2 (64,27)`, `dlogits (32,27)`.
+`dh = dlogits(32,27) @ W2.T(27,64) = (32,64)` ✓ matches `h`. `dW2 = h.T(64,32) @
+dlogits(32,27) = (64,27)` ✓ matches `W2`.
+
+**`.T` in code is just PyTorch's transpose shorthand** — swaps rows and columns (e.g. a
+`(2,3)` matrix's `.T` becomes `(3,2)`, same numbers, different row/column positions).
+Transposing here is specifically what makes the multiplication's shapes line up — without
+it, `dlogits @ W2` wouldn't even be a valid matrix multiply.
+
+**Why compute `dh` at all, given `h` isn't a trainable parameter?** Two different reasons
+for gradients in this exercise: `W2`/`b2`'s gradients are needed to actually *train* them
+(`W2.data -= lr*W2.grad`); `h`'s gradient is needed purely to *keep walking backward* through
+the chain — the next steps (`hpreact`, `bnraw`, etc.) all need `dh` as their starting
+"incoming gradient," per the chain rule, even though `h` itself is never directly updated.
+
+**`db2` — bias broadcasting, worked through with a concrete tiny example.** With `b2 =
+[10, 20, 30]` (3 characters) added to 2 examples' rows, `b2[0]=10` gets added into *both*
+example rows' first column (`logits[0][0]` and `logits[1][0]`) — used twice, once per
+example. So `b2`'s gradient must sum the contributions from every row it was broadcast
+into — concretely, "sum down each column across all rows":
+
+```python
+db2 = dlogits.sum(0)
+```
+
+`.sum(0)` collapses the row dimension: `dlogits (32,27) → (27,)`, matching `b2`'s own shape.
+
+```python
+cmp('h', dh, h)     → exact: True, maxdiff: 0.0
+cmp('W2', dW2, W2)   → exact: True, maxdiff: 0.0
+cmp('b2', db2, b2)   → exact: True, maxdiff: 0.0
+```
+
+All three verified exactly — completes the backward pass through the second Linear layer.
+
+## 16. tanh backward — the familiar micrograd formula, now on matrices
+
+`h = torch.tanh(hpreact)`. Same derivative rule as 01-micrograd (`d(tanh(x))/dx =
+1-tanh(x)^2`), expressed in terms of `h` itself (since `h` already equals `tanh(hpreact)`):
+
+```python
+dhpreact = (1.0 - h**2) * dh
+```
+
+Shapes match (`h` and `dh` both `(32,64)`), simple element-wise multiply.
+
+`cmp('hpreact', dhpreact, hpreact)` → **exact: True, maxdiff: 0.0**.
+
+## 17. BatchNorm backward, step 1 — dbngain, dbnraw, dbnbias
+
+Entering the multi-step BatchNorm backward chain — forward was written fully "unrolled"
+(section 3), so backward has to walk back through each of its 7 sub-steps individually.
+
+**First formula:** `hpreact = bngain * bnraw + bnbias`. Three separate inputs, each with a
+different role and shape:
+- `bngain` (1,64) — learnable BatchNorm scale (gamma), broadcast across all 32 rows.
+- `bnraw` (32,64) — the normalized (mean-0, std-1) values, not itself a trainable parameter
+  but needed as a stepping stone to continue backward further (toward `bndiff`, `bnvar_inv`).
+- `bnbias` (1,64) — learnable BatchNorm shift (beta), also broadcast across all 32 rows.
+
+**Worked through why `bngain`'s gradient needs `.sum(0)`, with a small concrete example**
+(`bngain=[2,5,3]` applied to 2 example rows): each element of `bngain` (e.g. the `2`) gets
+reused once per row it's broadcast into (2 uses here, since there are 2 examples) — same
+broadcasting-accumulation pattern as `b2` earlier. Since `bngain`'s shape has "1" in the row
+dimension, summing over dimension 0 ("down each column, across all rows") collapses back to
+that same `(1,64)` shape, matching what a valid gradient for `bngain` must look like.
+
+```python
+dbngain = (bnraw * dhpreact).sum(0, keepdim=True)   # multiply (chain rule) + sum (broadcast accumulation)
+dbnraw = bngain * dhpreact                             # no broadcast on this side — shapes already match
+dbnbias = dhpreact.sum(0, keepdim=True)                # same broadcast-sum pattern as bngain, but for
+                                                          # the addition case (like b2 earlier)
+```
+
+```python
+cmp('bngain', dbngain, bngain)   → exact: True, maxdiff: 0.0
+cmp('bnraw', dbnraw, bnraw)       → exact: True, maxdiff: 0.0
+cmp('bnbias', dbnbias, bnbias)    → exact: True, maxdiff: 0.0
+```
+
+All three verified exactly. `bngain`/`bnbias`'s gradients will later drive their training
+updates; `bnraw`'s gradient is needed purely to keep walking backward through the rest of
+BatchNorm's unrolled steps (`bndiff`, `bnvar_inv`, `bnvar`, `bndiff2`, `bnmeani`, back to
+`hprebn`).
+
+## 18. BatchNorm backward, step 2 — dbnvar_inv, dbndiff (partial), dbnvar
+
+**Formula:** `bnraw = bndiff * bnvar_inv`. Same broadcasting pattern as `counts *
+counts_sum_inv` earlier: `bndiff` is `(32,64)`, `bnvar_inv` is `(1,64)` (one value per
+neuron, broadcast across all 32 rows).
+
+```python
+dbnvar_inv = (bndiff * dbnraw).sum(0, keepdim=True)   # broadcast side: multiply + sum
+dbndiff = bnvar_inv * dbnraw                             # non-broadcast side: no extra sum needed here
+                                                            # (this is only the PARTIAL contribution —
+                                                            # bndiff is used in a second place too,
+                                                            # to be added later)
+```
+
+`cmp('bnvar_inv', dbnvar_inv, bnvar_inv)` → **exact: True, maxdiff: 0.0**.
+
+**Formula:** `bnvar_inv = (bnvar + 1e-5)**-0.5`. Power rule (`f(x)=x^n → f'(x)=n*x^(n-1)`)
+with `n=-0.5`:
+```
+f'(x) = -0.5 * (x + 1e-5)^-1.5
+```
+
+```python
+dbnvar = (-0.5 * (bnvar + 1e-5)**-1.5) * dbnvar_inv
+```
+
+Shapes match (`(1,64)` both), no broadcasting subtlety here.
+
+`cmp('bnvar', dbnvar, bnvar)` → **exact: True, maxdiff: 0.0**.
+
+**On the `1e-5` in the formula:** scientific notation for `0.00001` — an "epsilon," added
+to prevent a divide-by-zero/undefined-gradient blowup if `bnvar` (a variance) ever came out
+to exactly 0 for some neuron (e.g. if all its outputs across the batch happened to be
+identical). `1/sqrt(0)` is undefined; `1/sqrt(0.00001)` is safe and large but well-defined.
+Negligible effect on the actual computed value, purely a numerical-safety guard — same
+general category of trick as the `logit_maxes` subtraction used earlier for `exp()`
+stability.
+
 ## 8. Open questions / next steps
 
 - Continue the backward chain: `dcounts`, `dnorm_logits`, `dlogit_maxes`, `dlogits`, then
