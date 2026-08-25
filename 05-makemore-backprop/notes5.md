@@ -444,6 +444,37 @@ Negligible effect on the actual computed value, purely a numerical-safety guard 
 general category of trick as the `logit_maxes` subtraction used earlier for `exp()`
 stability.
 
+## 19. BatchNorm backward, step 3 — dbndiff2, dbndiff (complete)
+
+**Formula:** `bnvar = 1/(n-1) * bndiff2.sum(0, keepdim=True)`. Two things happening: a
+constant multiplier (`1/(n-1)`, fixed since `n` is fixed) and a sum.
+
+**Key insight about constant multipliers in chain rule, worked through with a small
+example:** for `y = 3*x`, nudging `x` by 1 changes `y` by exactly 3 (verified:
+`x=2→y=6`, `x=3→y=9`) — a constant multiplier's local derivative *is* the constant itself.
+Combined with the sum's "distribute the gradient equally to every term" rule from before:
+
+```python
+dbndiff2 = (1.0/(n-1)) * torch.ones_like(bndiff2) * dbnvar
+```
+
+`cmp('bndiff2', dbndiff2, bndiff2)` → **exact: True, maxdiff: 0.0**.
+
+**`bndiff` is used in two places, needs both contributions summed:**
+```python
+bnraw = bndiff * bnvar_inv    # path 1 — already computed earlier (partial dbndiff)
+bndiff2 = bndiff**2             # path 2 — new
+```
+
+Path 2 uses the power rule with `n=2`: `f(x)=x^2 → f'(x)=2x`.
+
+```python
+dbndiff += 2 * bndiff * dbndiff2   # accumulate onto the path-1 contribution already held
+```
+
+`cmp('bndiff', dbndiff, bndiff)` → **exact: True, maxdiff: 0.0** — confirms both paths'
+contributions combined correctly.
+
 ## 8. Open questions / next steps
 
 - Continue the backward chain: `dcounts`, `dnorm_logits`, `dlogit_maxes`, `dlogits`, then
